@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# Data and training outputs
+data/
+logs/
+*.pt
+*.pth
+*.nbpack
+*.log
+run*.log
+results*.tsv
+*.png
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Claude internal
+.claude/
+
+# Torch compile cache (Windows)
+C:/tmp/triton/
+C:/tmp/inductor/
+
+# Misc
+.env
+.playwright-mcp/
+models/
