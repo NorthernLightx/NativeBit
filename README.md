@@ -1,85 +1,117 @@
 # NativeBit
 
-**Train neural networks in their quantized representation from birth.**
+What if neural networks were never float? NativeBit trains models in their quantized representation from the start. Instead of the usual train-then-compress pipeline, each weight block learns its own codebook during training via straight-through estimation + EMA updates.
 
-Instead of the standard train-in-float-then-compress pipeline, NativeBit co-discovers optimal quantization values during training via per-block learned codebooks. The model is *native* to its bit representation from the first gradient step.
+The result: models trained at 2-4 bit precision that match float quality, with no training overhead.
 
-## Key Insight
+## Results
 
-3-bit NativeBit matches or beats float baselines. Quantization acts as regularization -- the discrete codebook constraint prevents overfitting, similar to how dropout or weight decay regularize continuous weights.
+Perplexity on WikiText-103 (lower is better):
 
-## How It Works
+| Scale | Float | NativeBit 3-bit | Gap |
+|-------|-------|----------------|-----|
+| 22M | 101.21 | 96.46 | -4.7% (NB is better) |
+| 125M | 185.74 | 185.95 ± 0.24 | +0.11% |
+| 350M | 192.06 | 193.68 | +0.84% |
 
-1. **Per-block learned codebooks** -- every 64 weights share a codebook of 8 entries (3-bit). Codebook values are learned jointly with weights via gradient descent.
+At 125M the gap is 0.11%, smaller than seed variance. At 22M, quantization noise actually helps as regularization.
 
-2. **Gradient-scaled STE** -- the straight-through estimator passes gradients through quantization. We scale gradients by proximity to the codebook entry: weights close to their entry get full gradient, distant weights get reduced gradient to prevent oscillation.
+The bit width is just a config parameter (codebook size K). At 125M on WikiText-103:
 
-3. **Stochastic rounding** -- during training, each weight occasionally snaps to its 2nd-nearest codebook entry (with probability proportional to proximity). This adds exploration and prevents codebook assignments from getting stuck.
+| Bits | K | PPL | vs Float |
+|------|---|-----|----------|
+| 2 | 4 | 193.71 | +4.3% |
+| ~2.6 | 6 | 192.88 | +3.8% |
+| 3 | 8 | 185.95 | +0.11% |
+| 4 | 16 | 192.65 | +3.7% |
 
-4. **Split-based revival** -- dead codebook entries are revived by splitting the most-used entry symmetrically, preserving the weight distribution.
+3-bit is the sweet spot where quality matches float. 2-bit still holds much better than post-hoc methods at the same width.
 
-5. **Value embeddings** -- float-precision token embeddings are injected into attention values on alternating layers, providing a clean bypass for quantization-degraded attention. Per-head gating learns how much to rely on this bypass.
+Compared to post-hoc methods (applied to the same trained float model):
 
-6. **Logit soft-capping** -- `logits = 30 * tanh(logits / 30)` prevents extreme logits and stabilizes late training.
+| Method | 125M PPL | vs Float |
+|--------|----------|----------|
+| NativeBit 3-bit | 185.95 | +0.11% |
+| RTN 3-bit | 186.35 | +0.3% |
+| K-means 8-entry | 188.36 | +1.4% |
+| NativeBit 2-bit | 193.71 | +4.3% |
+| K-means 4-entry | 211.44 | +13.8% |
 
-## Architecture
+The advantage grows at lower bit widths. At 2-bit, post-hoc k-means degrades by 13.8% while NativeBit holds at 4.3%.
 
-LLaMA-style transformer: RoPE, RMSNorm, SwiGLU, no bias, weight-tied embeddings.
+## How it works
 
-- Embeddings, LM head, and layer norms stay in full precision
-- All other linear layers use `NativeBitLinear` (3-bit codebook quantization)
-- Value embeddings shared with token embeddings (weight-tied)
+The core idea is simple: quantize weights every forward pass, but let gradients flow through via STE. The codebook entries (the allowed weight values) update via EMA rather than gradients, which eliminates the codebook learning rate and works better in practice (+4.6% over gradient-based).
 
-## Quick Start
+The expensive part is the quantization itself (distance computation + argmin over all weights). We cache the quantization assignments and reuse them for N steps. A factorial experiment across learning rates, bit widths, and model scales showed that N can go up to 500 with no quality impact, which makes the training overhead effectively zero.
+
+Training speed on TPU v6e-8:
+
+| Requantize interval | Overhead |
+|--------------------|----------|
+| Every step | 10x |
+| Every 10 steps | 1.27x |
+| Every 200 steps | 1.0x |
+
+## Project structure
+
+Two backends: PyTorch for local GPU development, JAX/Flax for TPU training at scale.
+
+```
+nativebit/           PyTorch backend
+nativebit_jax/       JAX/Flax backend (TPU)
+configs/             Model configs (48M to 1B+)
+autoresearch/        Autonomous hyperparameter search
+experiments/         Ablations and sweeps
+```
+
+`nativebit/layers.py` and `nativebit_jax/layers.py` are the core files. NativeBitLinear/NativeBitDense are drop-in replacements for nn.Linear/nn.Dense.
+
+## Quick start
+
+PyTorch (any GPU):
+```bash
+pip install torch tiktoken matplotlib tqdm
+python train.py --name test --max-steps 50          # quick test
+python train.py --name float_baseline --no-nativebit # float baseline
+python train.py --name nb_3bit                       # NativeBit 3-bit
+```
+
+JAX (Cloud TPU):
+```bash
+pip install 'jax[tpu]' -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+pip install flax optax tiktoken tqdm datasets
+python -m nativebit_jax.train --config tpu-medium --name nb_125m
+```
+
+## Autoresearch
+
+There's an autonomous experiment runner that searches hyperparameters by analyzing training logs for problems (dead codebook entries, gradient issues, plateaus) and picking the next config accordingly.
 
 ```bash
-# Install
-pip install -e .
-
-# Train NativeBit model (3-bit, WikiText-2)
-python train.py --name nativebit --max-steps 5000
-
-# Train float baseline for comparison
-python train.py --name float --no-nativebit --max-steps 5000
-
-# Export to packed 3-bit format
-python export.py --checkpoint logs/nativebit_final.pt --output model.nbpack
+python autoresearch_run.py --resume --max-hours 4
+python autoresearch_run.py --report
 ```
 
-## Project Structure
+## Design choices
 
-```
-nativebit/
-  layers.py          NativeBitLinear (the core quantized layer)
-  model.py           LLaMA-style GPT with value embeddings
-  codebook_utils.py  Codebook initialization and revival
-  data.py            WikiText-2 data loading + BPB metric
-  pack.py            3-bit packing for inference
-  generate.py        Text generation from checkpoints
-  logging.py         Training metrics (JSONL)
-  seed.py            Reproducibility
+- Per-block codebooks (block_size=128), not per-layer or global
+- EMA codebook updates, not gradient-based
+- Embeddings, LM head, and norms stay in float
+- Percentile-based codebook initialization
+- LLaMA-style architecture: RoPE, RMSNorm, SwiGLU, weight tying
+- Self-contained, no HuggingFace/GPTQ/AWQ dependencies
 
-configs/
-  default.py         Default training configuration
+## What's next
 
-train.py             Main training entry point
-export.py            Pack models to 3-bit format
-tests/               Automated test suite
-```
+The scaling results (22M to 350M) show the quality gap stays under 1%, but the real test is whether this holds at 2B+ where most deployment happens. The main blocker is model sharding across TPU chips, which the current single-chip code doesn't support. BitNet b1.58 showed their approach works at 2B with ternary weights; we want to compare learned codebooks against fixed grids at the same scale.
 
-## Design Principles
-
-- **No post-hoc compression.** The model trains in its quantized format from step 1.
-- **Per-block codebooks.** Each block of 64 weights learns its own 8-entry codebook. This is more flexible than global quantization (different layers need different value ranges).
-- **Gradient-based codebook learning.** Codebook entries are `nn.Parameter`s that receive gradients and are updated by the optimizer, just like weights.
-- **Everything stays simple.** Pure PyTorch, no custom CUDA kernels, no external quantization libraries.
-
-## Requirements
-
-- Python 3.10+
-- PyTorch >= 2.0
-- tiktoken
-- Single GPU (tested on RTX 3070 8GB)
+Other things worth exploring:
+- Training on larger datasets (The Pile, RedPajama) where the regularization effect might behave differently
+- Downstream benchmarks (HellaSwag, PIQA, ARC) instead of just perplexity
+- Custom inference kernels that exploit the codebook structure for actual speedup, not just compression
+- Combining weight quantization with activation quantization
+- Progressive bit-width schedules where the model starts at higher precision and compresses during training
 
 ## License
 

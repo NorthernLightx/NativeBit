@@ -108,6 +108,9 @@ class CausalSelfAttention(nn.Module):
         # Apply RoPE to Q and K
         q, k = _apply_rope(q, k, self.rope_cos, self.rope_sin)
 
+        # Ensure matching dtypes (RoPE outputs float32, v may be bf16 under XLA autocast)
+        v = v.to(q.dtype)
+
         # Flash/fused attention
         out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         out = out.transpose(1, 2).contiguous().view(B, T, C)

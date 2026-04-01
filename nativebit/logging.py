@@ -33,6 +33,21 @@ class TrainingLogger:
         self._csv_header_written = False
         self.start_time = time.time()
 
+    def log_header(self, config) -> None:
+        """Emit a header line with config metadata for the dashboard."""
+        header = {
+            "type": "header",
+            "max_steps": getattr(config, "max_steps", 0),
+            "use_nativebit": True,  # overridden by caller if needed
+            "n_codebook": getattr(config, "n_codebook", 8),
+            "block_size": getattr(config, "block_size", 64),
+            "batch_size": getattr(config, "batch_size", 8),
+            "lr": getattr(config, "lr", 0),
+            "dataset": getattr(config, "dataset", "wikitext-2"),
+        }
+        with open(self.jsonl_path, "a") as f:
+            f.write(json.dumps(header) + "\n")
+
     def log_step(
         self,
         step: int,
@@ -123,25 +138,31 @@ class TrainingLogger:
 
 
 def compute_gradient_info(model: torch.nn.Module) -> dict:
-    """Compute gradient magnitude ratio: codebook grads vs main weight grads."""
-    cb_grad_norm = 0.0
+    """Compute gradient magnitude ratio: codebook grads vs main weight grads.
+
+    Accumulates norms on-device, single .item() at the end to avoid
+    per-parameter XLA graph breaks.
+    """
+    device = next(model.parameters()).device
+    cb_grad_norm = torch.tensor(0.0, device=device)
     cb_count = 0
-    w_grad_norm = 0.0
+    w_grad_norm = torch.tensor(0.0, device=device)
     w_count = 0
 
     for name, param in model.named_parameters():
         if param.grad is None:
             continue
-        g = param.grad.data.float().norm().item()
+        g = param.grad.data.float().norm()
         if "codebook" in name:
-            cb_grad_norm += g
+            cb_grad_norm = cb_grad_norm + g
             cb_count += 1
         elif "weight" in name and "ln" not in name and "tok_emb" not in name:
-            w_grad_norm += g
+            w_grad_norm = w_grad_norm + g
             w_count += 1
 
-    cb_avg = cb_grad_norm / max(cb_count, 1)
-    w_avg = w_grad_norm / max(w_count, 1)
+    # Single sync point
+    cb_avg = (cb_grad_norm / max(cb_count, 1)).item()
+    w_avg = (w_grad_norm / max(w_count, 1)).item()
     ratio = cb_avg / max(w_avg, 1e-12)
 
     return {

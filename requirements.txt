@@ -1,0 +1,11 @@
+# PyTorch backend
+torch>=2.0
+tiktoken
+matplotlib
+tqdm
+
+# JAX backend (install jax[tpu] separately for TPU support)
+# jax>=0.4.35
+# flax
+# optax
+# datasets

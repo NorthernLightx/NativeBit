@@ -1,8 +1,7 @@
 """NativeBitLinear -- drop-in nn.Linear replacement with learned per-block codebooks.
 
 Each weight is quantized to its nearest codebook entry during the forward pass.
-Gradients flow through quantization via the straight-through estimator (STE),
-scaled by proximity to the codebook entry to reduce noise for poorly-quantized weights.
+Gradients flow through quantization via the straight-through estimator (STE).
 """
 
 import math
@@ -55,6 +54,12 @@ class NativeBitLinear(nn.Module):
             "utilization", torch.zeros(self.num_blocks, n_entries, dtype=torch.long)
         )
 
+        # Pre-computed block index for gather — avoid torch.arange every forward
+        self.register_buffer(
+            "_block_idx", torch.arange(self.num_blocks).unsqueeze(1),
+            persistent=False,
+        )
+
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
@@ -73,8 +78,7 @@ class NativeBitLinear(nn.Module):
     def _quantize(self, w_flat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Quantize weights to nearest codebook entries.
 
-        During training, uses stochastic rounding: occasionally picks the 2nd-nearest
-        entry with probability proportional to proximity, adding exploration.
+        Uses squared L2 distance and plain argmin.
         """
         if self._padded_len > self.total_weights:
             w_padded = F.pad(w_flat, (0, self._padded_len - self.total_weights))
@@ -82,22 +86,10 @@ class NativeBitLinear(nn.Module):
             w_padded = w_flat
 
         w_blocks = w_padded.view(self.num_blocks, self.block_size)
-        dists = (w_blocks.unsqueeze(-1) - self.codebook.unsqueeze(1)).abs()
+        dists = (w_blocks.unsqueeze(-1) - self.codebook.unsqueeze(1)).square()
+        indices = dists.argmin(dim=-1)
 
-        if self.training:
-            # Stochastic rounding: occasionally pick 2nd-nearest entry
-            top2 = dists.topk(2, dim=-1, largest=False)
-            d1, d2 = top2.values[:, :, 0], top2.values[:, :, 1]
-            p_second = d1 / (d1 + d2 + 1e-8)
-            use_second = torch.rand_like(p_second) < (p_second * 0.3)
-            indices = torch.where(use_second, top2.indices[:, :, 1], top2.indices[:, :, 0])
-        else:
-            indices = dists.argmin(dim=-1)
-
-        quantized_blocks = torch.gather(
-            self.codebook.unsqueeze(1).expand(-1, self.block_size, -1),
-            dim=2, index=indices.unsqueeze(-1),
-        ).squeeze(-1)
+        quantized_blocks = self.codebook[self._block_idx, indices]
 
         return quantized_blocks.view(-1)[:self.total_weights], indices
 
@@ -106,11 +98,11 @@ class NativeBitLinear(nn.Module):
         quantized_flat, indices = self._quantize(w_flat)
         self._last_indices = indices
 
-        # Gradient-scaled STE: weights far from their codebook entry get reduced
-        # gradient to prevent oscillation. Close weights get full gradient.
-        quant_error = (quantized_flat.view_as(self.weight) - self.weight).detach().abs()
-        scale = 1.0 / (1.0 + quant_error * 5.0)
-        quantized_w = quantized_flat.view_as(self.weight) + scale * (self.weight - self.weight.detach())
+        # Plain STE: forward uses quantized weights, backward flows to latent
+        # weights only. Codebook is updated separately (EMA or dedicated loss),
+        # not through the task loss gradient — this avoids expensive backward
+        # through the gather and is compatible with EMA codebook updates.
+        quantized_w = self.weight + (quantized_flat.view_as(self.weight) - self.weight).detach()
 
         return F.linear(x, quantized_w, self.bias)
 

@@ -33,7 +33,43 @@ Thumbs.db
 C:/tmp/triton/
 C:/tmp/inductor/
 
+# Screenshots
+screenshots/
+
 # Misc
 .env
 .playwright-mcp/
 models/
+
+# Internal / one-off
+CLAUDE.MD
+RESEARCH_IDEAS.md
+PAPER_PLAN.md
+paper/
+docs/
+infra/
+scripts/
+nul
+deploy_*.sh
+provision_*.sh
+provision.log
+test_*.py
+plot_*.py
+nativebit_jax/speed_test*.py
+
+analysis/report_phase3.md
+run_350m_nb_clean.py
+
+# Superseded run scripts (keep run_350m_clean.py and run_doe_rq.py)
+run_350m.py
+run_350m_nb.py
+run_350m_nb_v6e.py
+run_350m_v4.py
+run_350m_v6e_bs8.py
+run_350m_float_bs8.py
+run_350m_rq_sweep.py
+run_best.py
+run_queue.py
+run_remaining.py
+run_doe_125m.py
+run_350m_float_bs8.py

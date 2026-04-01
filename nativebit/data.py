@@ -328,14 +328,15 @@ def compute_bpb(model, loader, device: torch.device) -> float:
     import torch.nn.functional as F
     import math
 
-    token_bytes = _get_token_byte_table(device)
-    total_nats = 0.0
-    total_bytes = 0
+    from nativebit.device import amp_context, mark_step
 
-    use_amp = device.type == "cuda"
+    token_bytes = _get_token_byte_table(device)
+    total_nats = torch.tensor(0.0, device=device)
+    total_bytes_t = torch.tensor(0, dtype=torch.long, device=device)
+
     for x, y in loader:
         x, y = x.to(device), y.to(device)
-        with torch.amp.autocast("cuda", enabled=use_amp):
+        with amp_context(device):
             logits = model(x)
             loss_flat = F.cross_entropy(
                 logits.view(-1, logits.size(-1)), y.view(-1), reduction='none'
@@ -344,9 +345,11 @@ def compute_bpb(model, loader, device: torch.device) -> float:
         y_flat = y.view(-1)
         nbytes = token_bytes[y_flat]
         mask = nbytes > 0
-        total_nats += (loss_flat.float() * mask).sum().item()
-        total_bytes += nbytes.sum().item()
+        total_nats += (loss_flat.float() * mask).sum()
+        total_bytes_t += nbytes.sum()
+        mark_step()
 
-    if total_bytes == 0:
+    total_bytes_val = total_bytes_t.item()
+    if total_bytes_val == 0:
         return float('inf')
-    return total_nats / (math.log(2) * total_bytes)
+    return total_nats.item() / (math.log(2) * total_bytes_val)
