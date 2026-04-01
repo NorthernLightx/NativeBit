@@ -62,7 +62,8 @@ nativebit/           PyTorch backend
 nativebit_jax/       JAX/Flax backend (TPU)
 configs/             Model configs (48M to 1B+)
 autoresearch/        Autonomous hyperparameter search
-experiments/         Ablations and sweeps
+benchmarks/          Post-hoc quantization comparisons
+experiments/         Ablations, sweeps, and run scripts
 ```
 
 `nativebit/layers.py` and `nativebit_jax/layers.py` are the core files. NativeBitLinear/NativeBitDense are drop-in replacements for nn.Linear/nn.Dense.
@@ -89,8 +90,8 @@ python -m nativebit_jax.train --config tpu-medium --name nb_125m
 There's an autonomous experiment runner that searches hyperparameters by analyzing training logs for problems (dead codebook entries, gradient issues, plateaus) and picking the next config accordingly.
 
 ```bash
-python autoresearch_run.py --resume --max-hours 4
-python autoresearch_run.py --report
+python autoresearch/autoresearch_run.py --resume --max-hours 4
+python autoresearch/autoresearch_run.py --report
 ```
 
 ## Design choices
