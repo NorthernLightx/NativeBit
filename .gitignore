@@ -58,6 +58,18 @@ plot_*.py
 nativebit_jax/speed_test*.py
 
 analysis/report_phase3.md
+experiments/phase_*.py
+experiments/phase2_*.py
+experiments/phase2b_*.py
+experiments/phase2c_*.py
+experiments/bench_*.py
+experiments/block_*.py
+experiments/doe_*.py
+experiments/lr_*.py
+experiments/scaleup.py
+experiments/tinystories*.py
+experiments/tpu_*.py
+experiments/test_*.py
 run_350m_nb_clean.py
 
 # Superseded run scripts (keep run_350m_clean.py and run_doe_rq.py)
