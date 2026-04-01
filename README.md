@@ -85,6 +85,16 @@ pip install flax optax tiktoken tqdm datasets
 python -m nativebit_jax.train --config tpu-medium --name nb_125m
 ```
 
+## Dashboard
+
+There's a live training dashboard that plots loss, perplexity, codebook utilization, and gradient stats in real time. Works with local logs or can sync from a TPU VM.
+
+```bash
+python analysis/dashboard.py --log-dir logs          # local logs
+python analysis/dashboard.py --tpu-name my-tpu \     # sync from TPU
+    --tpu-zone europe-west4-a
+```
+
 ## Autoresearch
 
 There's an autonomous experiment runner that searches hyperparameters by analyzing training logs for problems (dead codebook entries, gradient issues, plateaus) and picking the next config accordingly.
