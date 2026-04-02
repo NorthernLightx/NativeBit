@@ -9,6 +9,7 @@ Usage:
 """
 
 import argparse
+import functools
 import json
 import math
 import os
@@ -61,11 +62,12 @@ def load_tokens(dataset: str = "wikitext-2", data_dir: str = "data"):
     for our_name, hf_split in split_map.items():
         cache_path = os.path.join(cache_dir, f"{our_name}.tokens.bin")
 
+        import numpy as np
         if os.path.exists(cache_path):
             with open(cache_path, "rb") as f:
                 a = array.array("i")
                 a.frombytes(f.read())
-            results[our_name] = jnp.frombuffer(a, dtype=jnp.int32).copy()
+            results[our_name] = np.frombuffer(a, dtype=np.int32).copy()
             continue
 
         # Download via HuggingFace datasets
@@ -79,29 +81,37 @@ def load_tokens(dataset: str = "wikitext-2", data_dir: str = "data"):
         a = array.array("i", tokens)
         with open(cache_path, "wb") as f:
             a.tofile(f)
-        results[our_name] = jnp.array(tokens, dtype=jnp.int32)
+        results[our_name] = np.array(tokens, dtype=np.int32)
 
     train, valid, test = results["train"], results["valid"], results["test"]
     print(f"  [{dataset}] Train: {len(train)} tok, Valid: {len(valid)}, Test: {len(test)}")
     return train, valid, test
 
 
-def make_batches(tokens: jnp.ndarray, ctx_len: int, batch_size: int,
-                 rng: jax.Array):
-    """Yield (x, y) batches from token array, shuffled."""
+def make_batches(tokens, ctx_len: int, batch_size: int, rng: jax.Array):
+    """Yield (x, y) batches from token array, shuffled.
+
+    Tokens stay as numpy on host. Each batch is converted to jnp on yield.
+    Shuffle uses numpy (seeded from JAX rng) to avoid device allocation.
+    """
+    import numpy as np
+    tokens = np.asarray(tokens)
     n_seq = (len(tokens) - 1) // ctx_len
     all_tokens = tokens[:n_seq * ctx_len + 1]
     all_x = all_tokens[:-1].reshape(n_seq, ctx_len)
     all_y = all_tokens[1:].reshape(n_seq, ctx_len)
 
-    perm = jax.random.permutation(rng, n_seq)
+    # Use JAX rng to seed numpy shuffle (stays on host)
+    seed = int(jax.random.bits(rng, (), dtype=jnp.uint32)) % (2**31)
+    np_rng = np.random.RandomState(seed)
+    perm = np_rng.permutation(n_seq)
     all_x = all_x[perm]
     all_y = all_y[perm]
 
     n_batches = n_seq // batch_size
     for i in range(n_batches):
         s = i * batch_size
-        yield all_x[s:s + batch_size], all_y[s:s + batch_size]
+        yield jnp.array(all_x[s:s + batch_size]), jnp.array(all_y[s:s + batch_size])
 
 
 # ---------------------------------------------------------------------------
@@ -522,6 +532,12 @@ def train(config, use_nativebit: bool = True, use_aqt: bool = False,
                 with open(jsonl_path, "a") as f:
                     f.write(json.dumps(record) + "\n")
 
+                # Sync log to GCS every 500 steps
+                if step % 500 == 0:
+                    import subprocess
+                    subprocess.Popen(["gsutil", "-q", "cp", str(jsonl_path), "gs://nativebit-runs/"],
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
                 print(f"  step={step:>5d}  loss={loss_val:.4f}  ppl={ppl:>10.2f}  "
                       f"sps={instant_sps:.1f}", flush=True)
 
@@ -542,6 +558,10 @@ def train(config, use_nativebit: bool = True, use_aqt: bool = False,
                 }
                 np.savez(ckpt_file, **{k: np.array(v) for k, v in flat.items()})
                 print(f"  Checkpoint: {ckpt_file}", flush=True)
+                # Sync to GCS if available (preemption resilience)
+                import subprocess
+                subprocess.Popen(["gsutil", "-q", "cp", ckpt_file, "gs://nativebit-runs/"],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 # Keep only last 2
                 import glob as glob_mod
                 ckpts = sorted(glob_mod.glob(os.path.join(log_dir, f"{experiment_name}_step*.npz")))
@@ -579,6 +599,12 @@ def train(config, use_nativebit: bool = True, use_aqt: bool = False,
     import numpy as np
     np.savez(ckpt_path, **{k: np.array(v) for k, v in flat_params.items()})
     print(f"  Checkpoint: {ckpt_path}")
+
+    # Sync final results to GCS
+    import subprocess
+    for f in [ckpt_path, str(jsonl_path)]:
+        subprocess.Popen(["gsutil", "-q", "cp", f, "gs://nativebit-runs/"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     return {"test_loss": test_loss, "test_ppl": test_ppl, "params": state.params}
 

@@ -130,15 +130,15 @@ class TPU2BConfig:
     n_embd: int = 2560
     n_head: int = 20
     ffn_hidden: int = 6912
-    context_len: int = 2048
+    context_len: int = 1024    # matches 125M/350M experiments
     vocab_size: int = 50257
 
     block_size: int = 128
     n_codebook: int = 8
 
-    batch_size: int = 32       # 4 per chip on v6e-8 with FSDP
-    lr: float = 1.5e-4
-    codebook_lr: float = 1.5e-5
+    batch_size: int = 64       # 8 per chip on v6e-8 with FSDP
+    lr: float = 3e-4           # linear scaling: 2x batch → 2x LR
+    codebook_lr: float = 3e-5
     max_steps: int = 20000
     warmup_steps: int = 1000
     grad_clip: float = 1.0
