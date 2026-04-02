@@ -22,6 +22,7 @@ import jax.numpy as jnp
 import optax
 from flax.training import train_state
 import orbax.checkpoint as ocp
+from jax.sharding import Mesh, PartitionSpec as P, NamedSharding
 
 # Add parent to path so configs/ is importable
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -295,6 +296,30 @@ def make_eval_step(model):
     return eval_step
 
 
+def setup_fsdp(params):
+    """Shard params across devices (FSDP). No-op on single device.
+
+    Shards 2D+ params along first dim when evenly divisible, replicates otherwise.
+    XLA automatically inserts allgather/reduce-scatter in jitted functions.
+    """
+    n_devices = jax.device_count()
+    if n_devices <= 1:
+        return params, None
+
+    mesh = Mesh(jax.devices(), axis_names=('fsdp',))
+
+    def _shard(x):
+        if x.ndim >= 2 and x.shape[0] % n_devices == 0:
+            spec = P('fsdp', *([None] * (x.ndim - 1)))
+        else:
+            spec = P(*([None] * x.ndim))
+        return jax.device_put(x, NamedSharding(mesh, spec))
+
+    sharded = jax.tree.map(_shard, params)
+    print(f"  FSDP: sharded across {n_devices} devices")
+    return sharded, mesh
+
+
 # ---------------------------------------------------------------------------
 # Main training loop
 # ---------------------------------------------------------------------------
@@ -321,9 +346,7 @@ def train(config, use_nativebit: bool = True, use_aqt: bool = False,
 
     # Init params (including cache collection for quantized weight caching)
     dummy_x = jnp.ones((1, config.context_len), dtype=jnp.int32)
-    variables = model.init(init_rng, dummy_x)
-    # variables may contain {"params": ..., "cache": ...}
-    params = variables
+    params = model.init(init_rng, dummy_x)
 
     # Scale residual projections to prevent signal explosion in deep models
     params = apply_init_scaling(params, config.n_layers)
@@ -355,6 +378,16 @@ def train(config, use_nativebit: bool = True, use_aqt: bool = False,
         # Populate cache with initial quantized deltas
         from nativebit_jax.layers import requantize_params
         params, _ = requantize_params(params)
+
+    # FSDP sharding (auto-enabled on multi-device)
+    params, mesh = setup_fsdp(params)
+    import gc; gc.collect()  # Free pre-shard allocations
+    data_sharding = NamedSharding(mesh, P('fsdp', None)) if mesh else None
+
+    def _to_device(x, y):
+        if data_sharding is not None:
+            return jax.device_put(x, data_sharding), jax.device_put(y, data_sharding)
+        return x, y
 
     n_params = sum(x.size for x in jax.tree.leaves(params))
     print(f"  Params: {n_params / 1e6:.1f}M")
@@ -397,6 +430,7 @@ def train(config, use_nativebit: bool = True, use_aqt: bool = False,
     rng, preflight_rng = jax.random.split(rng)
     batch_iter = make_batches(train_tokens, config.context_len, config.batch_size, preflight_rng)
     preflight_x, preflight_y = next(batch_iter)
+    preflight_x, preflight_y = _to_device(preflight_x, preflight_y)
 
     # Use a copy — don't corrupt the real state
     pf_state = state
@@ -445,6 +479,8 @@ def train(config, use_nativebit: bool = True, use_aqt: bool = False,
 
         for x_batch, y_batch in make_batches(train_tokens, config.context_len,
                                               config.batch_size, epoch_rng):
+            x_batch, y_batch = _to_device(x_batch, y_batch)
+
             # External requantize: update cached deltas every N steps
             delay_quant = getattr(config, "delay_quant_steps", 0)
             quant_active = use_nativebit and step >= delay_quant
@@ -496,16 +532,21 @@ def train(config, use_nativebit: bool = True, use_aqt: bool = False,
                         f"Check LR, weight_decay, or init scaling."
                     )
 
-            # Periodic checkpoint for preemption resilience
+            # Periodic checkpoint (numpy — orbax incompatible with FSDP mesh)
             if step > 0 and step % ckpt_every == 0:
-                save_path = os.path.join(ckpt_dir, str(step))
-                checkpointer.save(save_path, state)
-                # Keep only last 2 checkpoints
-                ckpt_dirs = sorted(Path(ckpt_dir).iterdir())
-                for old in ckpt_dirs[:-2]:
-                    if old.is_dir():
-                        import shutil
-                        shutil.rmtree(old)
+                import numpy as np
+                ckpt_file = os.path.join(log_dir, f"{experiment_name}_step{step}.npz")
+                flat = {
+                    "/".join(str(p.key) if hasattr(p, 'key') else str(p) for p in path): val
+                    for path, val in jax.tree_util.tree_leaves_with_path(state.params)
+                }
+                np.savez(ckpt_file, **{k: np.array(v) for k, v in flat.items()})
+                print(f"  Checkpoint: {ckpt_file}", flush=True)
+                # Keep only last 2
+                import glob as glob_mod
+                ckpts = sorted(glob_mod.glob(os.path.join(log_dir, f"{experiment_name}_step*.npz")))
+                for old in ckpts[:-2]:
+                    os.remove(old)
 
             step += 1
             if step >= config.max_steps:
@@ -519,6 +560,7 @@ def train(config, use_nativebit: bool = True, use_aqt: bool = False,
     n_batches = 0
     for x_batch, y_batch in make_batches(test_tokens, config.context_len,
                                           config.batch_size, eval_rng):
+        x_batch, y_batch = _to_device(x_batch, y_batch)
         loss = eval_step_fn(state.params, x_batch, y_batch)
         total_loss += float(loss)
         n_batches += 1
@@ -554,7 +596,8 @@ def main():
     parser.add_argument("--log-dir", type=str, default="logs")
     parser.add_argument("--data-dir", type=str, default="data")
     parser.add_argument("--config", type=str, default="default",
-                        choices=["default", "tpu-small", "tpu-medium", "tpu-large"])
+                        choices=["default", "tpu-small", "tpu-medium", "tpu-large",
+                                 "tpu-xl", "tpu-2b"])
     parser.add_argument("--use-aqt", action="store_true",
                         help="Use AQT INT8 matmuls (requires aqt package)")
     parser.add_argument("--batch-size", type=int, default=None,
@@ -565,11 +608,14 @@ def main():
     config_map = {"default": DefaultConfig}
 
     if args.config.startswith("tpu"):
-        from configs.tpu import TPUSmallConfig, TPUMediumConfig, TPULargeConfig
+        from configs.tpu import (TPUSmallConfig, TPUMediumConfig, TPULargeConfig,
+                                  TPUXLConfig, TPU2BConfig)
         config_map.update({
             "tpu-small": TPUSmallConfig,
             "tpu-medium": TPUMediumConfig,
             "tpu-large": TPULargeConfig,
+            "tpu-xl": TPUXLConfig,
+            "tpu-2b": TPU2BConfig,
         })
 
     config = config_map[args.config]()
