@@ -334,6 +334,32 @@ def setup_fsdp(params):
 # Main training loop
 # ---------------------------------------------------------------------------
 
+def _get_gcs_bucket():
+    """Get or create a same-region GCS bucket for checkpoint sync.
+
+    CRITICAL: bucket must be in the same region as the TPU to avoid
+    cross-region transfer costs ($0.01-0.12/GB). Same-region is free.
+    """
+    import subprocess
+    # Detect region from TPU VM metadata
+    try:
+        zone = subprocess.run(
+            "curl -s http://metadata.google.internal/computeMetadata/v1/instance/zone -H 'Metadata-Flavor: Google'",
+            shell=True, capture_output=True, text=True, timeout=5).stdout.strip()
+        region = "-".join(zone.split("/")[-1].split("-")[:-1])  # e.g. europe-west4
+        project = subprocess.run(
+            "curl -s http://metadata.google.internal/computeMetadata/v1/project/project-id -H 'Metadata-Flavor: Google'",
+            shell=True, capture_output=True, text=True, timeout=5).stdout.strip()
+    except Exception:
+        return None  # Not on GCP
+
+    bucket = f"gs://{project}-nativebit-{region}"
+    # Create if doesn't exist (idempotent)
+    subprocess.run(f"gsutil mb -l {region} {bucket} 2>/dev/null; true",
+                   shell=True, timeout=15)
+    return bucket
+
+
 def train(config, use_nativebit: bool = True, use_aqt: bool = False,
           experiment_name: str = "nativebit_jax",
           log_dir: str = "logs", data_dir: str = "data"):
@@ -403,6 +429,11 @@ def train(config, use_nativebit: bool = True, use_aqt: bool = False,
     print(f"  Params: {n_params / 1e6:.1f}M")
     print(f"  Steps: {config.max_steps}")
 
+    # GCS bucket (same-region, auto-created)
+    gcs_bucket = _get_gcs_bucket()
+    if gcs_bucket:
+        print(f"  GCS: {gcs_bucket}")
+
     # Optimizer + state
     tx = make_optimizer(config)
     state = train_state.TrainState.create(apply_fn=model.apply, params=params, tx=tx)
@@ -466,8 +497,10 @@ def train(config, use_nativebit: bool = True, use_aqt: bool = False,
     import subprocess
     # Try downloading latest checkpoint from GCS
     try:
+        if gcs_bucket is None:
+            raise RuntimeError("No GCS bucket")
         gcs_ckpts = subprocess.run(
-            f"gsutil ls gs://nativebit-runs/{experiment_name}_step*.npz",
+            f"gsutil ls {gcs_bucket}/{experiment_name}_step*.npz",
             shell=True, capture_output=True, text=True, timeout=10)
         if gcs_ckpts.returncode == 0 and gcs_ckpts.stdout.strip():
             latest_gcs = sorted(gcs_ckpts.stdout.strip().split('\n'))[-1]
@@ -563,9 +596,9 @@ def train(config, use_nativebit: bool = True, use_aqt: bool = False,
                     f.write(json.dumps(record) + "\n")
 
                 # Sync log to GCS every 500 steps
-                if step % 500 == 0:
+                if step % 500 == 0 and gcs_bucket:
                     import subprocess
-                    subprocess.Popen(f"gsutil -q cp {jsonl_path} gs://nativebit-runs/",
+                    subprocess.Popen(f"gsutil -q cp {jsonl_path} {gcs_bucket}/",
                                      shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
                 print(f"  step={step:>5d}  loss={loss_val:.4f}  ppl={ppl:>10.2f}  "
@@ -590,11 +623,12 @@ def train(config, use_nativebit: bool = True, use_aqt: bool = False,
                 np.savez(ckpt_file, **{k: np.array(v) for k, v in flat.items()})
                 print(f"  Checkpoint: {ckpt_file}", flush=True)
                 # Sync to GCS: upload new, delete old (keep only latest)
-                gcs_base = f"gs://nativebit-runs/"
-                subprocess.Popen(
-                    f"gsutil -q cp {ckpt_file} {gcs_base} && "
-                    f"gsutil -q rm {gcs_base}{experiment_name}_step{step - ckpt_every}.npz 2>/dev/null; true",
-                    shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                if gcs_bucket:
+                    gcs_base = f"{gcs_bucket}/"
+                    subprocess.Popen(
+                        f"gsutil -q cp {ckpt_file} {gcs_base} && "
+                        f"gsutil -q rm {gcs_base}{experiment_name}_step{step - ckpt_every}.npz 2>/dev/null; true",
+                        shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 # Keep only last 2 locally
                 import glob as glob_mod
                 ckpts = sorted(glob_mod.glob(os.path.join(log_dir, f"{experiment_name}_step*.npz")))
@@ -642,14 +676,15 @@ def train(config, use_nativebit: bool = True, use_aqt: bool = False,
     print(f"  Checkpoint: {ckpt_path}")
 
     # Sync final results to GCS (blocking — don't exit before upload finishes)
-    import subprocess
-    for f in [str(jsonl_path), ckpt_path]:
-        subprocess.run(f"gsutil -q cp {f} gs://nativebit-runs/",
-                       shell=True, timeout=300)
-    # Clean up intermediate checkpoints from GCS
-    subprocess.run(
-        f"gsutil -q rm gs://nativebit-runs/{experiment_name}_step*.npz 2>/dev/null; true",
-        shell=True, timeout=60)
+    if gcs_bucket:
+        import subprocess
+        for f in [str(jsonl_path), ckpt_path]:
+            subprocess.run(f"gsutil -q cp {f} {gcs_bucket}/",
+                           shell=True, timeout=300)
+        # Clean up intermediate checkpoints from GCS
+        subprocess.run(
+            f"gsutil -q rm {gcs_bucket}/{experiment_name}_step*.npz 2>/dev/null; true",
+            shell=True, timeout=60)
 
     return {"test_loss": test_loss, "test_ppl": test_ppl, "params": state.params}
 
