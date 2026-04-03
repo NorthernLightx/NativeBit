@@ -117,9 +117,14 @@ class CausalSelfAttention(nn.Module):
 
         v = v.astype(q.dtype)
 
-        # Attention — not causal when using cache (cache already has prior tokens)
-        is_causal = kv_cache is None and T > 1
-        out = jax.nn.dot_product_attention(q, k, v, is_causal=is_causal)
+        # Attention
+        if kv_cache is not None:
+            # Manual attention for cached inference (avoids JAX GQA shape check)
+            scale = head_dim ** -0.5
+            attn = jnp.einsum('bhqd,bhkd->bhqk', q * scale, k)
+            out = jnp.einsum('bhqk,bhkd->bhqd', jax.nn.softmax(attn, axis=-1), v)
+        else:
+            out = jax.nn.dot_product_attention(q, k, v, is_causal=True)
         out = out.transpose(0, 2, 1, 3).reshape(B, T, C)
 
         return Linear(self.n_embd, use_bias=False)(out), new_cache
