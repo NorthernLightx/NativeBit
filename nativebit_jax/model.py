@@ -81,7 +81,7 @@ class CausalSelfAttention(nn.Module):
     compute_dtype: jnp.dtype = jnp.bfloat16
 
     @nn.compact
-    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+    def __call__(self, x: jnp.ndarray, kv_cache=None, pos_offset: int = 0):
         B, T, C = x.shape
         head_dim = self.n_embd // self.n_head
         Linear = _make_linear(self.use_nativebit, self.block_size, self.n_entries,
@@ -94,18 +94,35 @@ class CausalSelfAttention(nn.Module):
         k = k.reshape(B, T, self.n_head, head_dim).transpose(0, 2, 1, 3)
         v = v.reshape(B, T, self.n_head, head_dim).transpose(0, 2, 1, 3)
 
-        # RoPE
+        # RoPE — pos_offset shifts positions for KV-cached inference
         cos, sin = _precompute_rope(head_dim, self.context_len)
-        q, k = _apply_rope(q, k, cos, sin)
+        cos = jax.lax.dynamic_slice(cos, (pos_offset, 0), (T, cos.shape[1]))
+        sin = jax.lax.dynamic_slice(sin, (pos_offset, 0), (T, sin.shape[1]))
+        cos = cos[None, None, :, :]
+        sin = sin[None, None, :, :]
+        cos2 = jnp.repeat(cos, 2, axis=-1)
+        sin2 = jnp.repeat(sin, 2, axis=-1)
+        def rotate(x):
+            x1, x2 = x[..., ::2], x[..., 1::2]
+            return jnp.stack((-x2, x1), axis=-1).reshape(x.shape)
+        q = q * cos2 + rotate(q) * sin2
+        k = k * cos2 + rotate(k) * sin2
 
-        # Ensure matching dtypes
+        # KV cache for inference
+        if kv_cache is not None:
+            cached_k, cached_v = kv_cache
+            k = jnp.concatenate([cached_k, k], axis=2)
+            v = jnp.concatenate([cached_v, v], axis=2)
+        new_cache = (k, v)
+
         v = v.astype(q.dtype)
 
-        # Scaled dot-product attention (causal)
-        out = jax.nn.dot_product_attention(q, k, v, is_causal=True)
+        # Attention — not causal when using cache (cache already has prior tokens)
+        is_causal = kv_cache is None and T > 1
+        out = jax.nn.dot_product_attention(q, k, v, is_causal=is_causal)
         out = out.transpose(0, 2, 1, 3).reshape(B, T, C)
 
-        return Linear(self.n_embd, use_bias=False)(out)
+        return Linear(self.n_embd, use_bias=False)(out), new_cache
 
 
 class SwiGLU(nn.Module):
@@ -139,14 +156,15 @@ class TransformerBlock(nn.Module):
     compute_dtype: jnp.dtype = jnp.bfloat16
 
     @nn.compact
-    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-        x = x + CausalSelfAttention(
+    def __call__(self, x: jnp.ndarray, kv_cache=None, pos_offset: int = 0):
+        attn_out, new_cache = CausalSelfAttention(
             n_head=self.n_head, n_embd=self.n_embd,
             context_len=self.context_len,
             block_size=self.block_size, n_entries=self.n_entries,
             use_nativebit=self.use_nativebit, use_aqt=self.use_aqt,
             compute_dtype=self.compute_dtype,
-        )(RMSNorm()(x))
+        )(RMSNorm()(x), kv_cache=kv_cache, pos_offset=pos_offset)
+        x = x + attn_out
 
         x = x + SwiGLU(
             n_embd=self.n_embd, ffn_hidden=self.ffn_hidden,
@@ -155,7 +173,7 @@ class TransformerBlock(nn.Module):
             compute_dtype=self.compute_dtype,
         )(RMSNorm()(x))
 
-        return x
+        return x, new_cache
 
 
 class NativeBitGPT(nn.Module):
@@ -176,7 +194,7 @@ class NativeBitGPT(nn.Module):
     compute_dtype: jnp.dtype = jnp.bfloat16
 
     @nn.compact
-    def __call__(self, idx: jnp.ndarray) -> jnp.ndarray:
+    def __call__(self, idx: jnp.ndarray, kv_caches=None, pos_offset: int = 0):
         B, T = idx.shape
 
         # Embedding — full precision, NOT quantized
@@ -188,18 +206,20 @@ class NativeBitGPT(nn.Module):
         )
         x = embedding[idx]  # (B, T, C)
 
-        # Transformer blocks (remat = gradient checkpointing, saves ~60% memory)
-        # No branching in forward — remat-safe now that requantize is external
-        BlockClass = nn.remat(TransformerBlock)
+        # Transformer blocks — remat for training, plain for inference
+        BlockClass = nn.remat(TransformerBlock) if kv_caches is None else TransformerBlock
+        new_caches = []
         for i in range(self.n_layers):
-            x = BlockClass(
+            layer_cache = kv_caches[i] if kv_caches is not None else None
+            x, new_cache = BlockClass(
                 n_embd=self.n_embd, n_head=self.n_head,
                 ffn_hidden=self.ffn_hidden, context_len=self.context_len,
                 block_size=self.block_size, n_entries=self.n_entries,
                 use_nativebit=self.use_nativebit, use_aqt=self.use_aqt,
                 compute_dtype=self.compute_dtype,
                 name=f"block_{i}",
-            )(x)
+            )(x, kv_cache=layer_cache, pos_offset=pos_offset)
+            new_caches.append(new_cache)
 
         x = RMSNorm(name="ln_f")(x)
 
@@ -208,6 +228,9 @@ class NativeBitGPT(nn.Module):
 
         # Soft-capping
         logits = 30.0 * jnp.tanh(logits / 30.0)
+
+        if kv_caches is not None:
+            return logits, new_caches
         return logits
 
 
