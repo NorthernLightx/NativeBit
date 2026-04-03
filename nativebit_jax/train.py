@@ -459,20 +459,50 @@ def train(config, use_nativebit: bool = True, use_aqt: bool = False,
 
     # --- Checkpointing setup ---
     ckpt_every = getattr(config, "checkpoint_every", 500)
-    ckpt_dir = os.path.abspath(os.path.join(log_dir, f"{experiment_name}_ckpt"))
-    checkpointer = ocp.StandardCheckpointer()
     resume_step = 0
 
-    # Resume from checkpoint if available
-    ckpt_path = Path(ckpt_dir)
-    if ckpt_path.exists():
-        latest = sorted(ckpt_path.iterdir())
-        if latest:
-            latest_step = int(latest[-1].name)
-            abstract_state = jax.tree.map(ocp.utils.to_shape_dtype_struct, state)
-            state = checkpointer.restore(str(latest[-1]), target=abstract_state)
-            resume_step = latest_step
-            print(f"  Resumed from checkpoint at step {resume_step}")
+    # Resume from numpy checkpoint (local or GCS)
+    import glob as glob_mod
+    import subprocess
+    # Try downloading latest checkpoint from GCS
+    try:
+        gcs_ckpts = subprocess.run(
+            f"gsutil ls gs://nativebit-runs/{experiment_name}_step*.npz",
+            shell=True, capture_output=True, text=True, timeout=10)
+        if gcs_ckpts.returncode == 0 and gcs_ckpts.stdout.strip():
+            latest_gcs = sorted(gcs_ckpts.stdout.strip().split('\n'))[-1]
+            local_ckpt = os.path.join(log_dir, os.path.basename(latest_gcs))
+            if not os.path.exists(local_ckpt):
+                subprocess.run(f"gsutil cp {latest_gcs} {local_ckpt}",
+                               shell=True, timeout=120)
+    except Exception:
+        pass
+
+    # Find latest local numpy checkpoint
+    local_ckpts = sorted(glob_mod.glob(os.path.join(log_dir, f"{experiment_name}_step*.npz")))
+    if local_ckpts:
+        latest_ckpt = local_ckpts[-1]
+        resume_step = int(latest_ckpt.split("_step")[-1].replace(".npz", ""))
+        print(f"  Resuming from {latest_ckpt} (step {resume_step})...", flush=True)
+        import numpy as np
+        ckpt_data = np.load(latest_ckpt)
+        # Rebuild params tree from flat dict
+        def _set_leaf(path, leaf):
+            key = "/".join(str(p.key) if hasattr(p, 'key') else str(p) for p in path)
+            if key in ckpt_data:
+                return jnp.array(ckpt_data[key])
+            return leaf
+        restored_params = jax.tree_util.tree_map_with_path(_set_leaf, state.params)
+        # Re-shard restored params
+        if mesh is not None:
+            def _reshard(old, new):
+                if hasattr(old, 'sharding'):
+                    return jax.device_put(new, old.sharding)
+                return new
+            restored_params = jax.tree.map(_reshard, state.params, restored_params)
+        state = state.replace(params=restored_params)
+        del ckpt_data, restored_params; gc.collect()
+        print(f"  Resumed at step {resume_step}")
 
     # --- Main loop ---
     step = resume_step
@@ -535,8 +565,8 @@ def train(config, use_nativebit: bool = True, use_aqt: bool = False,
                 # Sync log to GCS every 500 steps
                 if step % 500 == 0:
                     import subprocess
-                    subprocess.Popen(["gsutil", "-q", "cp", str(jsonl_path), "gs://nativebit-runs/"],
-                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    subprocess.Popen(f"gsutil -q cp {jsonl_path} gs://nativebit-runs/",
+                                     shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
                 print(f"  step={step:>5d}  loss={loss_val:.4f}  ppl={ppl:>10.2f}  "
                       f"sps={instant_sps:.1f}", flush=True)
@@ -551,6 +581,7 @@ def train(config, use_nativebit: bool = True, use_aqt: bool = False,
             # Periodic checkpoint (numpy — orbax incompatible with FSDP mesh)
             if step > 0 and step % ckpt_every == 0:
                 import numpy as np
+                import subprocess
                 ckpt_file = os.path.join(log_dir, f"{experiment_name}_step{step}.npz")
                 flat = {
                     "/".join(str(p.key) if hasattr(p, 'key') else str(p) for p in path): val
@@ -558,11 +589,13 @@ def train(config, use_nativebit: bool = True, use_aqt: bool = False,
                 }
                 np.savez(ckpt_file, **{k: np.array(v) for k, v in flat.items()})
                 print(f"  Checkpoint: {ckpt_file}", flush=True)
-                # Sync to GCS if available (preemption resilience)
-                import subprocess
-                subprocess.Popen(["gsutil", "-q", "cp", ckpt_file, "gs://nativebit-runs/"],
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                # Keep only last 2
+                # Sync to GCS: upload new, delete old (keep only latest)
+                gcs_base = f"gs://nativebit-runs/"
+                subprocess.Popen(
+                    f"gsutil -q cp {ckpt_file} {gcs_base} && "
+                    f"gsutil -q rm {gcs_base}{experiment_name}_step{step - ckpt_every}.npz 2>/dev/null; true",
+                    shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                # Keep only last 2 locally
                 import glob as glob_mod
                 ckpts = sorted(glob_mod.glob(os.path.join(log_dir, f"{experiment_name}_step*.npz")))
                 for old in ckpts[:-2]:
@@ -587,24 +620,36 @@ def train(config, use_nativebit: bool = True, use_aqt: bool = False,
 
     test_loss = total_loss / max(n_batches, 1)
     test_ppl = math.exp(min(test_loss, 20))
+    elapsed_total = time.time() - start_time
     print(f"  Test loss: {test_loss:.4f}  Test PPL: {test_ppl:.2f}")
-    print(f"  Total time: {time.time() - start_time:.0f}s")
+    print(f"  Total time: {elapsed_total:.0f}s")
 
-    # Save checkpoint (params as numpy arrays for portability)
+    # Write eval results to JSONL (so they survive even if stdout is lost)
+    with open(jsonl_path, "a") as f:
+        f.write(json.dumps({
+            "type": "eval", "test_loss": round(test_loss, 6),
+            "test_ppl": round(test_ppl, 2), "total_time_s": round(elapsed_total, 0),
+        }) + "\n")
+
+    # Save final checkpoint
+    import numpy as np
     ckpt_path = os.path.join(log_dir, f"{experiment_name}_params.npz")
     flat_params = {
         "/".join(str(p.key) if hasattr(p, 'key') else str(p) for p in path): val
         for path, val in jax.tree_util.tree_leaves_with_path(state.params)
     }
-    import numpy as np
     np.savez(ckpt_path, **{k: np.array(v) for k, v in flat_params.items()})
     print(f"  Checkpoint: {ckpt_path}")
 
-    # Sync final results to GCS
+    # Sync final results to GCS (blocking — don't exit before upload finishes)
     import subprocess
-    for f in [ckpt_path, str(jsonl_path)]:
-        subprocess.Popen(["gsutil", "-q", "cp", f, "gs://nativebit-runs/"],
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    for f in [str(jsonl_path), ckpt_path]:
+        subprocess.run(f"gsutil -q cp {f} gs://nativebit-runs/",
+                       shell=True, timeout=300)
+    # Clean up intermediate checkpoints from GCS
+    subprocess.run(
+        f"gsutil -q rm gs://nativebit-runs/{experiment_name}_step*.npz 2>/dev/null; true",
+        shell=True, timeout=60)
 
     return {"test_loss": test_loss, "test_ppl": test_ppl, "params": state.params}
 
