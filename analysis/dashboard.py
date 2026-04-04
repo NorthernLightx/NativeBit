@@ -8,7 +8,7 @@ Usage:
     python analysis/dashboard.py \
         --tpu-name nativebit-v6e \
         --tpu-zone europe-west4-a \
-        --tpu-project REDACTED_PROJECT_ID
+        --tpu-project YOUR_PROJECT_ID
 
     # Local mode (reads existing log files)
     python analysis/dashboard.py --log-dir logs/tpu

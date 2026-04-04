@@ -13,7 +13,7 @@
 
 set -euo pipefail
 
-PROJECT="REDACTED_PROJECT_ID"
+PROJECT="${GCP_PROJECT:?Set GCP_PROJECT env var}"
 ZONE="europe-west4-a"
 ACCEL="v6e-8"
 RUNTIME="v2-alpha-tpuv6e"
