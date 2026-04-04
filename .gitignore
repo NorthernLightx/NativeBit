@@ -86,3 +86,4 @@ run_remaining.py
 run_doe_125m.py
 run_350m_float_bs8.py
 *.nbpack.npz
+CLAUDE.md
