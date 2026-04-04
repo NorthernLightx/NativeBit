@@ -9,7 +9,7 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 
-from .layers import NativeBitDense
+from .layers import NativeBitDense, PackedNativeBitDense
 
 
 class RMSNorm(nn.Module):
@@ -52,9 +52,18 @@ def _apply_rope(q, k, cos, sin):
 
 
 def _make_linear(use_nativebit: bool, block_size: int, n_entries: int,
-                 compute_dtype: jnp.dtype, use_aqt: bool = False):
-    """Return constructor for NativeBitDense or nn.Dense."""
-    if use_nativebit:
+                 compute_dtype: jnp.dtype, use_aqt: bool = False,
+                 use_packed: bool = False):
+    """Return constructor for PackedNativeBitDense, NativeBitDense, or nn.Dense."""
+    if use_packed:
+        def make(features, use_bias=False):
+            return PackedNativeBitDense(
+                features=features, use_bias=use_bias,
+                block_size=block_size, n_entries=n_entries,
+                compute_dtype=compute_dtype,
+            )
+        return make
+    elif use_nativebit:
         def make(features, use_bias=False):
             return NativeBitDense(
                 features=features, use_bias=use_bias,
@@ -78,14 +87,16 @@ class CausalSelfAttention(nn.Module):
     n_entries: int = 8
     use_nativebit: bool = True
     use_aqt: bool = False
+    use_packed: bool = False
     compute_dtype: jnp.dtype = jnp.bfloat16
 
     @nn.compact
-    def __call__(self, x: jnp.ndarray, kv_cache=None, pos_offset: int = 0):
+    def __call__(self, x: jnp.ndarray, kv_cache=None):
         B, T, C = x.shape
         head_dim = self.n_embd // self.n_head
         Linear = _make_linear(self.use_nativebit, self.block_size, self.n_entries,
-                              self.compute_dtype, self.use_aqt)
+                              self.compute_dtype, self.use_aqt,
+                              use_packed=self.use_packed)
 
         qkv = Linear(3 * self.n_embd, use_bias=False)(x)
         q, k, v = jnp.split(qkv, 3, axis=-1)
@@ -94,7 +105,8 @@ class CausalSelfAttention(nn.Module):
         k = k.reshape(B, T, self.n_head, head_dim).transpose(0, 2, 1, 3)
         v = v.reshape(B, T, self.n_head, head_dim).transpose(0, 2, 1, 3)
 
-        # RoPE — pos_offset shifts positions for KV-cached inference
+        # RoPE — position offset derived from KV cache length
+        pos_offset = kv_cache[2] if kv_cache is not None else 0
         cos, sin = _precompute_rope(head_dim, self.context_len)
         cos = jax.lax.dynamic_slice(cos, (pos_offset, 0), (T, cos.shape[1]))
         sin = jax.lax.dynamic_slice(sin, (pos_offset, 0), (T, sin.shape[1]))
@@ -108,25 +120,31 @@ class CausalSelfAttention(nn.Module):
         q = q * cos2 + rotate(q) * sin2
         k = k * cos2 + rotate(k) * sin2
 
-        # KV cache for inference
         if kv_cache is not None:
-            cached_k, cached_v = kv_cache
-            k = jnp.concatenate([cached_k, k], axis=2)
-            v = jnp.concatenate([cached_v, v], axis=2)
-        new_cache = (k, v)
+            # Static-shape KV cache: write new K/V, attend with mask
+            k_buf, v_buf, cache_len = kv_cache
+            k_buf = jax.lax.dynamic_update_slice(k_buf, k.astype(k_buf.dtype), (0, 0, cache_len, 0))
+            v_buf = jax.lax.dynamic_update_slice(v_buf, v.astype(v_buf.dtype), (0, 0, cache_len, 0))
+            new_len = cache_len + T
 
-        v = v.astype(q.dtype)
-
-        # Attention
-        if kv_cache is not None:
-            # Manual attention for cached inference (avoids JAX GQA shape check)
             scale = head_dim ** -0.5
-            attn = jnp.einsum('bhqd,bhkd->bhqk', q * scale, k)
-            out = jnp.einsum('bhqk,bhkd->bhqd', jax.nn.softmax(attn, axis=-1), v)
+            attn = jnp.einsum('bhqd,bhkd->bhqk', q * scale, k_buf)
+            # Causal + validity mask (static shape, data-dependent values)
+            q_pos = cache_len + jnp.arange(T)
+            k_pos = jnp.arange(k_buf.shape[2])
+            mask = (k_pos[None, :] <= q_pos[:, None]) & (k_pos[None, :] < new_len)
+            attn = jnp.where(mask[None, None, :, :], attn, -1e30)
+            out = jnp.einsum('bhqk,bhkd->bhqd',
+                             jax.nn.softmax(attn, axis=-1),
+                             v_buf.astype(q.dtype))
+            new_cache = (k_buf, v_buf, new_len)
         else:
+            # Training: flash attention, no cache
+            v = v.astype(q.dtype)
             out = jax.nn.dot_product_attention(q, k, v, is_causal=True)
-        out = out.transpose(0, 2, 1, 3).reshape(B, T, C)
+            new_cache = None
 
+        out = out.transpose(0, 2, 1, 3).reshape(B, T, C)
         return Linear(self.n_embd, use_bias=False)(out), new_cache
 
 
@@ -138,12 +156,14 @@ class SwiGLU(nn.Module):
     n_entries: int = 8
     use_nativebit: bool = True
     use_aqt: bool = False
+    use_packed: bool = False
     compute_dtype: jnp.dtype = jnp.bfloat16
 
     @nn.compact
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
         Linear = _make_linear(self.use_nativebit, self.block_size, self.n_entries,
-                              self.compute_dtype, self.use_aqt)
+                              self.compute_dtype, self.use_aqt,
+                              use_packed=self.use_packed)
         gate = nn.silu(Linear(self.ffn_hidden, use_bias=False)(x))
         up = Linear(self.ffn_hidden, use_bias=False)(x)
         return Linear(self.n_embd, use_bias=False)(gate * up)
@@ -158,23 +178,26 @@ class TransformerBlock(nn.Module):
     n_entries: int = 8
     use_nativebit: bool = True
     use_aqt: bool = False
+    use_packed: bool = False
     compute_dtype: jnp.dtype = jnp.bfloat16
 
     @nn.compact
-    def __call__(self, x: jnp.ndarray, kv_cache=None, pos_offset: int = 0):
+    def __call__(self, x: jnp.ndarray, kv_cache=None):
         attn_out, new_cache = CausalSelfAttention(
             n_head=self.n_head, n_embd=self.n_embd,
             context_len=self.context_len,
             block_size=self.block_size, n_entries=self.n_entries,
             use_nativebit=self.use_nativebit, use_aqt=self.use_aqt,
+            use_packed=self.use_packed,
             compute_dtype=self.compute_dtype,
-        )(RMSNorm()(x), kv_cache=kv_cache, pos_offset=pos_offset)
+        )(RMSNorm()(x), kv_cache=kv_cache)
         x = x + attn_out
 
         x = x + SwiGLU(
             n_embd=self.n_embd, ffn_hidden=self.ffn_hidden,
             block_size=self.block_size, n_entries=self.n_entries,
             use_nativebit=self.use_nativebit, use_aqt=self.use_aqt,
+            use_packed=self.use_packed,
             compute_dtype=self.compute_dtype,
         )(RMSNorm()(x))
 
@@ -196,10 +219,11 @@ class NativeBitGPT(nn.Module):
     n_entries: int = 8
     use_nativebit: bool = True
     use_aqt: bool = False
+    use_packed: bool = False
     compute_dtype: jnp.dtype = jnp.bfloat16
 
     @nn.compact
-    def __call__(self, idx: jnp.ndarray, kv_caches=None, pos_offset: int = 0):
+    def __call__(self, idx: jnp.ndarray, kv_caches=None):
         B, T = idx.shape
 
         # Embedding — full precision, NOT quantized
@@ -221,9 +245,10 @@ class NativeBitGPT(nn.Module):
                 ffn_hidden=self.ffn_hidden, context_len=self.context_len,
                 block_size=self.block_size, n_entries=self.n_entries,
                 use_nativebit=self.use_nativebit, use_aqt=self.use_aqt,
+                use_packed=self.use_packed,
                 compute_dtype=self.compute_dtype,
                 name=f"block_{i}",
-            )(x, kv_cache=layer_cache, pos_offset=pos_offset)
+            )(x, kv_cache=layer_cache)
             new_caches.append(new_cache)
 
         x = RMSNorm(name="ln_f")(x)
@@ -240,7 +265,7 @@ class NativeBitGPT(nn.Module):
 
 
 def build_model(config, use_nativebit: bool = True,
-                use_aqt: bool = False) -> NativeBitGPT:
+                use_aqt: bool = False, use_packed: bool = False) -> NativeBitGPT:
     """Build model from config."""
     return NativeBitGPT(
         vocab_size=config.vocab_size,
@@ -253,6 +278,7 @@ def build_model(config, use_nativebit: bool = True,
         n_entries=config.n_codebook,
         use_nativebit=use_nativebit,
         use_aqt=use_aqt,
+        use_packed=use_packed,
     )
 
 

@@ -11,10 +11,11 @@ Perplexity on WikiText-103 (lower is better):
 | Scale | Float | NativeBit 3-bit | Gap |
 |-------|-------|----------------|-----|
 | 22M | 101.21 | 96.46 | -4.7% (NB is better) |
-| 125M | 185.74 | 185.95 ± 0.24 | +0.11% |
+| 125M | 185.74 | 185.95 | +0.11% |
 | 350M | 192.06 | 193.68 | +0.84% |
+| **2.2B** | **180.64** | **178.98** | **-0.92% (NB is better)** |
 
-At 125M the gap is 0.11%, smaller than seed variance. At 22M, quantization noise actually helps as regularization.
+At 2.2B (matching BitNet b1.58 scale: 26 layers, 2560 hidden, 6912 FFN), NB 3-bit beats float. The packed model is 1.70 GB vs 8.76 GB float (5.1x compression).
 
 The bit width is just a config parameter (codebook size K). At 125M on WikiText-103:
 
@@ -60,13 +61,14 @@ Two backends: PyTorch for local GPU development, JAX/Flax for TPU training at sc
 ```
 nativebit/           PyTorch backend
 nativebit_jax/       JAX/Flax backend (TPU)
-configs/             Model configs (48M to 1B+)
+inference/           Packed inference (Triton + CUDA kernels)
+configs/             Model configs (48M to 2.2B)
 autoresearch/        Autonomous hyperparameter search
 benchmarks/          Post-hoc quantization comparisons
 experiments/         Ablations, sweeps, and run scripts
 ```
 
-`nativebit/layers.py` and `nativebit_jax/layers.py` are the core files. NativeBitLinear/NativeBitDense are drop-in replacements for nn.Linear/nn.Dense.
+`nativebit/layers.py` and `nativebit_jax/layers.py` are the core files. NativeBitLinear/NativeBitDense are drop-in replacements for nn.Linear/nn.Dense. `inference/triton_kernel.py` and `inference/cuda_kernel.py` provide fused dequant-matvec kernels for deployment.
 
 ## Quick start
 
@@ -113,14 +115,34 @@ python autoresearch/autoresearch_run.py --report
 - LLaMA-style architecture: RoPE, RMSNorm, SwiGLU, weight tying
 - Self-contained, no HuggingFace/GPTQ/AWQ dependencies
 
+## Inference
+
+Training checkpoints pack into a minimal format: 3-bit codebook indices + codebook tables + unquantized params. The 2.2B model goes from 8.76 GB to 1.70 GB on disk.
+
+For single-token decode (the bottleneck in generation), we have custom kernels that read packed indices directly from VRAM instead of materialized weight matrices:
+
+```bash
+# JAX (TPU/CPU) — static KV cache, no recompilation per token
+python inference/generate.py inference/2b_nb3.nbpack.npz --packed --benchmark
+
+# PyTorch + Triton/CUDA kernels (GPU)
+python inference/generate_torch.py inference/2b_nb3.nbpack.npz --benchmark
+```
+
+RTX 3070 (2.2B model, same unoptimized model code for both):
+
+| Method | VRAM | Decode tok/s |
+|--------|------|-------------|
+| Float fp16 (native) | 4.38 GB | 12.2 |
+| NB 3-bit (CUDA kernel) | 1.80 GB | 8.1 |
+
+NB trades ~1.5x speed for 2.4x VRAM savings. On 4 GB GPUs, fp16 doesn't fit but NB does. Per-layer, the Triton uint8 kernel matches cuBLAS fp16 (0.113 ms vs 0.115 ms); the end-to-end gap is from the CUDA 3-bit kernel doing fp32 compute while fp16 uses half-precision throughout.
+
 ## What's next
 
-The scaling results (22M to 350M) show the quality gap stays under 1%, but the real test is whether this holds at 2B+ where most deployment happens. The main blocker is model sharding across TPU chips, which the current single-chip code doesn't support. BitNet b1.58 showed their approach works at 2B with ternary weights; we want to compare learned codebooks against fixed grids at the same scale.
-
-Other things worth exploring:
-- Training on larger datasets (The Pile, RedPajama) where the regularization effect might behave differently
 - Downstream benchmarks (HellaSwag, PIQA, ARC) instead of just perplexity
-- Custom inference kernels that exploit the codebook structure for actual speedup, not just compression
+- Warp-level CUDA kernel (32 threads per row with coalesced reads) to close the per-layer 1.37x gap
+- Training on larger datasets (The Pile, RedPajama) where the regularization effect might behave differently
 - Combining weight quantization with activation quantization
 - Progressive bit-width schedules where the model starts at higher precision and compresses during training
 

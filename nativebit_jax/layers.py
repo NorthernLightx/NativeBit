@@ -160,6 +160,57 @@ class NativeBitDense(nn.Module):
         return out.astype(x.dtype)
 
 
+class PackedNativeBitDense(nn.Module):
+    """Dense layer with on-the-fly weight reconstruction from packed indices.
+
+    Stores uint8 indices + fp32 codebook tables in HBM (~3x less than float).
+    Forward: fused codebook gather + matmul via Pallas kernel on TPU,
+    with naive fallback on CPU/GPU.
+    No latent weights, no STE — inference only.
+
+    Toggle: set NATIVEBIT_KERNEL=naive env var to force fallback.
+
+    Memory per layer: indices (uint8, num_blocks × block_size) +
+                      codebook (fp32, num_blocks × n_entries)
+    vs float Dense:   kernel (fp32, in × out)
+    Ratio: ~3x less for 3-bit (uint8 indices), ~5x with true 3-bit packing.
+    """
+    features: int
+    use_bias: bool = False
+    block_size: int = 128
+    n_entries: int = 8
+    compute_dtype: jnp.dtype = jnp.bfloat16
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        from .packed_kernel import packed_matmul
+
+        in_features = x.shape[-1]
+        out_features = self.features
+        total = out_features * in_features
+        num_blocks = math.ceil(total / self.block_size)
+
+        indices = self.param("indices", nn.initializers.zeros_init(),
+                             (num_blocks, self.block_size), jnp.uint8)
+        codebook = self.param("codebook", nn.initializers.zeros_init(),
+                              (num_blocks, self.n_entries), jnp.float32)
+
+        # Flatten batch dims for matmul: (..., in_features) → (M, in_features)
+        x_shape = x.shape
+        x_2d = x.reshape(-1, in_features)
+
+        out = packed_matmul(x_2d, indices, codebook,
+                            out_features, in_features, self.block_size)
+
+        if self.use_bias:
+            bias = self.param("bias", nn.initializers.zeros_init(),
+                              (out_features,), jnp.float32)
+            out = out + bias.astype(out.dtype)
+
+        # Restore batch dims
+        return out.reshape(*x_shape[:-1], out_features).astype(x.dtype)
+
+
 def _extract_layer_arrays(params_inner, cache):
     """Extract (weights, codebooks, deltas) as flat lists + metadata for jit."""
     weights, codebooks, deltas, meta = [], [], [], []
