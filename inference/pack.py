@@ -38,7 +38,7 @@ def quantize_weight(weight, codebook):
 def pack_indices_3bit(indices):
     """Pack uint8 indices (0-7) into 3-bit packed bytes.
 
-    8 indices → 3 bytes (24 bits = 8 × 3 bits).
+    8 indices → 3 bytes (24 bits = 8 × 3 bits). Vectorized with numpy.
     """
     flat = indices.reshape(-1)
     # Pad to multiple of 8
@@ -46,15 +46,15 @@ def pack_indices_3bit(indices):
     if pad:
         flat = np.pad(flat, (0, pad))
 
-    packed = bytearray()
-    for i in range(0, len(flat), 8):
-        # Pack 8 3-bit values into 3 bytes (24 bits)
-        vals = flat[i:i+8]
-        bits = 0
-        for j, v in enumerate(vals):
-            bits |= (int(v) & 0x7) << (j * 3)
-        packed.extend(bits.to_bytes(3, 'little'))
-    return bytes(packed)
+    groups = flat.reshape(-1, 8).astype(np.uint32)
+    bits24 = np.zeros(len(groups), dtype=np.uint32)
+    for j in range(8):
+        bits24 |= (groups[:, j] & 0x7) << (j * 3)
+    packed = np.zeros((len(groups), 3), dtype=np.uint8)
+    packed[:, 0] = bits24 & 0xFF
+    packed[:, 1] = (bits24 >> 8) & 0xFF
+    packed[:, 2] = (bits24 >> 16) & 0xFF
+    return packed.tobytes()
 
 
 def pack_checkpoint(ckpt_path, out_path, block_size=128, n_entries=8):
@@ -105,23 +105,28 @@ def pack_checkpoint(ckpt_path, out_path, block_size=128, n_entries=8):
         "params": {},
     }
 
+    # Quantize all layers once (avoid double computation)
+    save_dict = {}
     total_indices_bytes = 0
     total_codebook_bytes = 0
 
-    for prefix, (wk, ck) in sorted(quantized.items()):
+    for idx, (prefix, (wk, ck)) in enumerate(sorted(quantized.items())):
         weight = ckpt[wk].astype(np.float32)
         codebook = ckpt[ck].astype(np.float32)
 
         indices = quantize_weight(weight, codebook)
         packed_idx = pack_indices_3bit(indices)
 
-        packed_data["layers"][prefix] = {
-            "shape": list(weight.shape),
-            "codebook_shape": list(codebook.shape),
-        }
+        safe_prefix = prefix.replace("/", ".")
+        save_dict[f"idx.{safe_prefix}"] = np.frombuffer(packed_idx, dtype=np.uint8)
+        save_dict[f"cb.{safe_prefix}"] = codebook
+        save_dict[f"shape.{safe_prefix}"] = np.array(weight.shape)
+        save_dict[f"idxshape.{safe_prefix}"] = np.array(indices.shape)
 
         total_indices_bytes += len(packed_idx)
         total_codebook_bytes += codebook.nbytes
+        print(f"    [{idx+1}/{len(quantized)}] {prefix}: "
+              f"{weight.shape} -> {len(packed_idx)/1e6:.1f} MB", flush=True)
 
     total_nonquant_bytes = sum(ckpt[k].nbytes for k in non_quant_keys)
 
@@ -131,22 +136,6 @@ def pack_checkpoint(ckpt_path, out_path, block_size=128, n_entries=8):
     print(f"    Non-quantized:      {total_nonquant_bytes / 1e9:.2f} GB")
     total = total_indices_bytes + total_codebook_bytes + total_nonquant_bytes
     print(f"    TOTAL:              {total / 1e9:.2f} GB")
-
-    # Save as npz with packed data
-    save_dict = {}
-
-    # Quantized layers: indices (packed bytes) + codebooks
-    for prefix, (wk, ck) in sorted(quantized.items()):
-        weight = ckpt[wk].astype(np.float32)
-        codebook = ckpt[ck].astype(np.float32)
-        indices = quantize_weight(weight, codebook)
-        packed_idx = pack_indices_3bit(indices)
-
-        safe_prefix = prefix.replace("/", ".")
-        save_dict[f"idx.{safe_prefix}"] = np.frombuffer(packed_idx, dtype=np.uint8)
-        save_dict[f"cb.{safe_prefix}"] = codebook
-        save_dict[f"shape.{safe_prefix}"] = np.array(weight.shape)
-        save_dict[f"idxshape.{safe_prefix}"] = np.array(indices.shape)
 
     # Non-quantized params
     for k in non_quant_keys:

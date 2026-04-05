@@ -1,0 +1,19 @@
+{
+  "dataset": "wikitext-103",
+  "split": "test",
+  "context_len": 1024,
+  "float": {
+    "ppl": 181.66,
+    "loss": 5.2021,
+    "size_gb": 4.38,
+    "n_batches": 276
+  },
+  "nb_3bit": {
+    "ppl": 179.3,
+    "loss": 5.1891,
+    "size_gb": 4.38,
+    "n_batches": 276
+  },
+  "ppl_gap_pct": -1.3,
+  "compression": 1.0
+}

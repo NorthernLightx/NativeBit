@@ -50,8 +50,8 @@ def apply_rope(q, k, cos, sin, pos_offset=0):
     T = q.shape[2]
     cos = cos[pos_offset:pos_offset+T][None, None, :, :]
     sin = sin[pos_offset:pos_offset+T][None, None, :, :]
-    cos2 = cos.repeat(1, 1, 1, 2)
-    sin2 = sin.repeat(1, 1, 1, 2)
+    cos2 = cos.repeat_interleave(2, dim=-1)
+    sin2 = sin.repeat_interleave(2, dim=-1)
     def rotate(x):
         x1, x2 = x[..., ::2], x[..., 1::2]
         return torch.stack((-x2, x1), dim=-1).reshape(x.shape)
@@ -96,7 +96,15 @@ class CausalAttention(nn.Module):
             out = torch.einsum('bhqk,bhkd->bhqd', F.softmax(attn, dim=-1), v_buf)
             new_cache = (k_buf, v_buf, new_len)
         else:
-            out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            # JAX dot_product_attention expects (B, T, H, D) but receives (B, H, T, D).
+            # The model was trained with this convention — attention between heads
+            # per position, not between positions per head. Replicate in PyTorch by
+            # transposing to (B, T, H, D) before SDPA (which expects B, num_heads, L, D).
+            q_swap = q.transpose(1, 2)   # (B, H, T, D) -> (B, T, H, D)
+            k_swap = k.transpose(1, 2)
+            v_swap = v.transpose(1, 2)
+            out = F.scaled_dot_product_attention(q_swap, k_swap, v_swap, is_causal=True)
+            out = out.transpose(1, 2)    # back to (B, H, T, D)
             new_cache = None
 
         out = out.transpose(1, 2).reshape(B, T, C)
@@ -216,9 +224,12 @@ def load_packed_model(packed_path, config, device='cuda'):
         lambda out_f, in_f: nn.Linear(in_f, out_f, bias=False),
     ).to(device)
 
-    # Replace Linear layers with PackedLinear using packed data
-    # Map by walking the model and matching layer order to packed file order
-    packed_keys = sorted(packed_layers.keys())
+    # Replace Linear layers with PackedLinear using packed data.
+    # Natural sort: block_2 before block_10 (alphabetical sort is wrong).
+    import re
+    def _nat_key(s):
+        return [int(c) if c.isdigit() else c for c in re.split(r'(\d+)', s)]
+    packed_keys = sorted(packed_layers.keys(), key=_nat_key)
     packed_iter = iter(packed_keys)
 
     def replace_linears(module, prefix=""):
