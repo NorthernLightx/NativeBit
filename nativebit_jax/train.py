@@ -640,6 +640,13 @@ def train(config, use_nativebit: bool = True, use_aqt: bool = False,
                 break
 
     # --- Eval ---
+    # Refresh cached qw_delta from current latent weights so eval uses true
+    # Q(w_final) instead of a stale delta up to `requantize_every` steps old.
+    if use_nativebit:
+        from nativebit_jax.layers import requantize_params
+        fresh_params, _ = requantize_params(state.params, ema_decay)
+        state = state.replace(params=fresh_params)
+
     print(f"\nEval...")
     eval_step_fn = make_eval_step(model)
     eval_rng = jax.random.PRNGKey(0)

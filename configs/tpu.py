@@ -148,7 +148,12 @@ class TPU2BConfig:
     weight_decay: float = 0.1
     delay_quant_steps: int = 500
     ema_decay: float = 0.999
-    requantize_every: int = 200
+    # requantize_every=200 was too sparse: at peak LR, weights drift past
+    # codebook spacing within one cycle, so the STE forward uses increasingly
+    # stale quantized values. 125M/350M use 10 and match float; 2.2B used 200
+    # and lagged +15.7%. Changed to 10 to match the smaller scales.
+    # Cost: ~15% slower training. Worth it if it recovers PPL.
+    requantize_every: int = 10
     checkpoint_every: int = 1000
 
     dataset: str = "wikitext-103"
