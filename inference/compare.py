@@ -32,11 +32,12 @@ from inference.generate_torch import (
 )
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-DTYPE = torch.float16
+# bf16 has same range as fp32 (±3.4e38) — prevents NaN from bf16-trained weights
+DTYPE = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 
 
 # ---------------------------------------------------------------------------
-# Float model loader (JAX .npz -> PyTorch fp16)
+# Float model loader (JAX .npz -> PyTorch bf16)
 # ---------------------------------------------------------------------------
 
 def load_float_model(ckpt_path, config, device=DEVICE, dtype=DTYPE):
@@ -116,11 +117,13 @@ def init_kv_cache_typed(model, batch_size=1, device=DEVICE, dtype=torch.float32)
 
 @torch.no_grad()
 def generate(model, prompt_tokens, max_new=100, temperature=0.8, top_k=40,
-             rep_penalty=1.3, seed=42, device=DEVICE, cache_dtype=torch.float32):
-    """Autoregressive generation with KV cache and repetition penalty."""
+             rep_penalty=1.3, seed=42, device=DEVICE, context_len=1024,
+             cache_dtype=torch.bfloat16):
+    """Autoregressive generation with KV cache (standard cross-position attention)."""
     torch.manual_seed(seed)
     caches = init_kv_cache_typed(model, device=device, dtype=cache_dtype)
 
+    # Prefill: full prompt
     x = torch.tensor([prompt_tokens], dtype=torch.long, device=device)
     logits, caches = model(x, kv_caches=caches)
 
@@ -129,7 +132,6 @@ def generate(model, prompt_tokens, max_new=100, temperature=0.8, top_k=40,
     for i in range(max_new):
         logits_last = logits[0, -1].float()
 
-        # Repetition penalty: reduce logits of tokens already generated
         if rep_penalty != 1.0:
             seen = set(tokens)
             for tok_id in seen:
@@ -149,6 +151,7 @@ def generate(model, prompt_tokens, max_new=100, temperature=0.8, top_k=40,
             token = int(logits_last.argmax())
 
         tokens.append(token)
+
         x1 = torch.tensor([[token]], dtype=torch.long, device=device)
         logits, caches = model(x1, kv_caches=caches)
 
@@ -169,11 +172,26 @@ def free_model(model):
 # ---------------------------------------------------------------------------
 
 DEFAULT_PROMPTS = [
-    "The meaning of life is",
-    "In a shocking finding, scientists discovered that",
+    # News
     "The European Union announced today that",
-    "Once upon a time, in a land far away,",
+    # Science
+    "In a shocking finding, scientists discovered that",
+    # Dialogue
+    '"I never thought I would see you here," she said, looking',
+    # Code/technical
     "The key difference between machine learning and",
+    # Creative/narrative
+    "Once upon a time, in a land far away,",
+    # Philosophy
+    "The meaning of life is",
+    # History
+    "During the Renaissance, artists and scholars began to",
+    # Economics
+    "The Federal Reserve raised interest rates because",
+    # Instruction
+    "To build a simple neural network, first you need to",
+    # Nature
+    "Deep in the ocean, where sunlight cannot reach,",
 ]
 
 
@@ -189,6 +207,8 @@ def main():
     parser.add_argument("--rep-penalty", type=float, default=1.3,
                         help="Repetition penalty (1.0=off, 1.3=default)")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--output", type=str, default=None,
+                        help="Save comparison as markdown file")
     args = parser.parse_args()
 
     prompts = args.prompts or DEFAULT_PROMPTS
@@ -206,7 +226,7 @@ def main():
 
     # --- Phase 1: Float model ---
     print(f"\n{'_'*70}")
-    print("  Phase 1: Loading float fp16 model...")
+    print(f"  Phase 1: Loading float {DTYPE} model...")
     print(f"{'_'*70}")
     float_model = load_float_model(args.float_ckpt, config)
 
@@ -217,7 +237,7 @@ def main():
         tokens = generate(float_model, prompt_tokens,
                           max_new=args.max_new, temperature=args.temperature,
                           top_k=args.top_k, rep_penalty=args.rep_penalty,
-                          seed=args.seed, cache_dtype=DTYPE)
+                          seed=args.seed, context_len=config.context_len)
         elapsed = time.time() - t0
         text = enc.decode(tokens)
         float_outputs[prompt] = (text, elapsed)
@@ -237,8 +257,37 @@ def main():
               f"--out {args.nb_ckpt}")
         sys.exit(1)
 
-    nb_model = load_packed_model(args.nb_ckpt, config, device=DEVICE)
+    # Load on CPU, materialize packed weights to bf16 Dense for fast forward passes
+    nb_model = load_packed_model(args.nb_ckpt, config, device="cpu")
     nb_model.eval()
+    print("  Materializing packed weights to bf16 Dense...")
+    from inference.triton_kernel import PackedLinear, BS
+    for name, module in list(nb_model.named_modules()):
+        if isinstance(module, PackedLinear):
+            packed_idx = module.packed_indices.cpu()
+            codebook = module.codebook.cpu()
+            n_groups = packed_idx.shape[0] // 3
+            packed = packed_idx.reshape(n_groups, 3).to(torch.int32)
+            bits24 = packed[:, 0] | (packed[:, 1] << 8) | (packed[:, 2] << 16)
+            indices = torch.zeros(n_groups, 8, dtype=torch.int64)
+            for j in range(8):
+                indices[:, j] = (bits24 >> (j * 3)) & 0x7
+            num_blocks = codebook.shape[0]
+            total_idx = num_blocks * BS
+            indices = indices.reshape(-1)[:total_idx].reshape(num_blocks, BS)
+            block_idx = torch.arange(num_blocks).unsqueeze(1)
+            total = module.out_features * module.in_features
+            w = codebook[block_idx, indices].reshape(-1)[:total]
+            w = w.reshape(module.out_features, module.in_features).to(DTYPE)
+            linear = nn.Linear(module.in_features, module.out_features, bias=False)
+            linear.weight.data = w
+            parts = name.rsplit(".", 1)
+            if len(parts) == 2:
+                parent = dict(nb_model.named_modules())[parts[0]]
+                setattr(parent, parts[1], linear)
+    nb_model.to(DTYPE).to(DEVICE)
+    vram = torch.cuda.memory_allocated() / 1e6 if torch.cuda.is_available() else 0
+    print(f"  Done. VRAM: {vram:.0f} MB")
 
     nb_outputs = {}
     for prompt in prompts:
@@ -247,7 +296,7 @@ def main():
         tokens = generate(nb_model, prompt_tokens,
                           max_new=args.max_new, temperature=args.temperature,
                           top_k=args.top_k, rep_penalty=args.rep_penalty,
-                          seed=args.seed, cache_dtype=torch.float32)
+                          seed=args.seed, context_len=config.context_len)
         elapsed = time.time() - t0
         text = enc.decode(tokens)
         nb_outputs[prompt] = (text, elapsed)
@@ -287,6 +336,40 @@ def main():
     print(f"  NB 3-bit total:   {nb_total:.1f}s")
     print(f"  Speedup:          {float_total/nb_total:.2f}x")
     print(f"{'='*70}\n")
+
+    # Save markdown
+    if args.output:
+        with open(args.output, "w", encoding="utf-8") as f:
+            f.write("# NativeBit 2.2B: Generation Samples\n\n")
+            f.write("Side-by-side text generation from float fp16 and NativeBit 3-bit (5.1x compressed) models.\n\n")
+            f.write(f"**Settings:** temperature={args.temperature}, top_k={args.top_k}, "
+                    f"rep_penalty={args.rep_penalty}, seed={args.seed}, "
+                    f"max_new={args.max_new}\n\n")
+            if torch.cuda.is_available():
+                f.write(f"**Hardware:** {torch.cuda.get_device_name(0)}\n\n")
+
+            for prompt in prompts:
+                float_text, float_time = float_outputs[prompt]
+                nb_text, nb_time = nb_outputs[prompt]
+                prompt_len = len(prompt)
+                float_gen = float_text[prompt_len:]
+                nb_gen = nb_text[prompt_len:]
+
+                f.write(f"---\n\n")
+                f.write(f"### Prompt: *{prompt}*\n\n")
+                f.write(f"**Float fp16** ({float_time:.1f}s)\n\n")
+                f.write(f"> {prompt}**{float_gen.strip()}**\n\n")
+                f.write(f"**NativeBit 3-bit** ({nb_time:.1f}s)\n\n")
+                f.write(f"> {prompt}**{nb_gen.strip()}**\n\n")
+
+            f.write(f"---\n\n")
+            f.write(f"## Timing Summary\n\n")
+            f.write(f"| Model | Total Time | Avg per prompt |\n")
+            f.write(f"|-------|-----------|----------------|\n")
+            f.write(f"| Float fp16 | {float_total:.1f}s | {float_total/len(prompts):.1f}s |\n")
+            f.write(f"| NB 3-bit | {nb_total:.1f}s | {nb_total/len(prompts):.1f}s |\n")
+
+        print(f"  Saved: {args.output}")
 
 
 if __name__ == "__main__":

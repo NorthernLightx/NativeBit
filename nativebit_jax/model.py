@@ -139,9 +139,18 @@ class CausalSelfAttention(nn.Module):
                              v_buf.astype(q.dtype))
             new_cache = (k_buf, v_buf, new_len)
         else:
-            # Training: flash attention, no cache
+            # Training: cross-position causal attention via manual einsum.
+            # fp32 softmax for numerical stability with NativeBit quantized weights.
+            # Pallas flash attention is incompatible with FSDP (Mosaic partitioning).
+            # dot_product_attention NaNs with NativeBit bf16 softmax.
+            # This is ~22% slower but correct for both float and NativeBit.
             v = v.astype(q.dtype)
-            out = jax.nn.dot_product_attention(q, k, v, is_causal=True)
+            scale = head_dim ** -0.5
+            attn = jnp.einsum('bhqd,bhkd->bhqk', q * scale, k)
+            causal_mask = jnp.tril(jnp.ones((T, T), dtype=jnp.bool_))
+            attn = jnp.where(causal_mask[None, None, :, :], attn, -1e30)
+            attn = jax.nn.softmax(attn.astype(jnp.float32), axis=-1).astype(q.dtype)
+            out = jnp.einsum('bhqk,bhkd->bhqd', attn, v)
             new_cache = None
 
         out = out.transpose(0, 2, 1, 3).reshape(B, T, C)

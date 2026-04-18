@@ -53,7 +53,8 @@ nul
 deploy_*.sh
 provision_*.sh
 provision.log
-test_*.py
+/test_*.py
+experiments/test_*.py
 plot_*.py
 nativebit_jax/speed_test*.py
 

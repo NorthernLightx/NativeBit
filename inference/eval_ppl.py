@@ -163,14 +163,14 @@ def main():
             block_idx = torch.arange(num_blocks).unsqueeze(1)
             total = module.out_features * module.in_features
             w = codebook[block_idx, indices].reshape(-1)[:total]
-            w = w.reshape(module.out_features, module.in_features).half()
+            w = w.reshape(module.out_features, module.in_features).to(torch.bfloat16)
             linear = torch.nn.Linear(module.in_features, module.out_features, bias=False)
             linear.weight.data = w
             parts = name.rsplit(".", 1)
             if len(parts) == 2:
                 parent = dict(nb_model.named_modules())[parts[0]]
                 setattr(parent, parts[1], linear)
-    nb_model.half()
+    nb_model.to(torch.bfloat16)
     nb_model.to(DEVICE)
     vram_mb = torch.cuda.memory_allocated() / 1e6
     print(f"  Done. VRAM: {vram_mb:.0f} MB")
