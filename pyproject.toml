@@ -18,6 +18,16 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest"]
+ci = [
+    "pytest",
+    "tiktoken",
+    "matplotlib",
+    "tqdm",
+    "jax",
+    "flax",
+    "optax",
+    "ml_dtypes",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
