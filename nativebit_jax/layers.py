@@ -6,15 +6,12 @@ Optional AQT (Accurate Quantized Training) for INT8 matmuls on TPU.
 """
 
 import math
-from functools import partial
 
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
 
 from .codebook_utils import ema_update_codebooks
-
-from .codebook_utils import init_codebook_percentile
 
 # Optional AQT import — gracefully degrade if not installed
 _aqt_available = False
@@ -47,33 +44,6 @@ def _quantize(weight_flat: jnp.ndarray, codebook: jnp.ndarray,
     quantized_blocks = codebook[block_idx, indices]
     quantized_flat = quantized_blocks.reshape(-1)[:total_weights]
     return quantized_flat, indices
-
-
-@partial(jax.jit, static_argnums=(2, 3, 4, 5))
-def _jitted_requantize_and_ema(weight, codebook, block_size, num_blocks,
-                                total_weights, padded_len, ema_decay):
-    """Requantize one layer + EMA codebook update.
-
-    Returns (new_delta_bf16, new_codebook, indices).
-    """
-    w_flat = weight.reshape(-1)
-    w_padded = jnp.pad(w_flat, (0, padded_len - total_weights))
-    w_blocks = w_padded.reshape(num_blocks, block_size)
-    block_idx = jnp.arange(num_blocks)[:, None]
-
-    # Quantize: distance + argmin + gather
-    dists = jnp.square(w_blocks[:, :, None] - codebook[:, None, :])
-    indices = jnp.argmin(dists, axis=-1)
-    quantized_blocks = codebook[block_idx, indices]
-    quantized_flat = quantized_blocks.reshape(-1)[:total_weights]
-
-    # Delta for cached forward pass
-    delta = (quantized_flat.reshape(weight.shape) - weight).astype(jnp.bfloat16)
-
-    # EMA codebook update
-    new_codebook = ema_update_codebooks(codebook, indices, w_blocks, ema_decay)
-
-    return delta, new_codebook, indices
 
 
 class NativeBitDense(nn.Module):
