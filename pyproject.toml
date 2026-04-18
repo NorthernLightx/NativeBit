@@ -1,6 +1,6 @@
 [build-system]
 requires = ["setuptools>=68.0"]
-build-backend = "setuptools.backends._legacy:_Backend"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "nativebit"
@@ -28,6 +28,9 @@ ci = [
     "optax",
     "ml_dtypes",
 ]
+
+[tool.setuptools.packages.find]
+include = ["nativebit*", "nativebit_jax*", "configs*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
