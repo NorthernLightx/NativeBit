@@ -69,7 +69,7 @@ class CausalAttention(nn.Module):
         self.out_proj = make_linear(n_embd, 3 * n_embd)  # dummy in_features, replaced by loader
         self.cos, self.sin = precompute_rope(self.head_dim, context_len)
 
-    def forward(self, x, kv_cache=None):
+    def forward(self, x, kv_cache=None, pos_offset=0):
         B, T, C = x.shape
         qkv = self.qkv(x)
         q, k, v = qkv.chunk(3, dim=-1)
@@ -77,7 +77,8 @@ class CausalAttention(nn.Module):
         k = k.reshape(B, T, self.n_head, self.head_dim).transpose(1, 2)
         v = v.reshape(B, T, self.n_head, self.head_dim).transpose(1, 2)
 
-        pos_offset = kv_cache[2] if kv_cache is not None else 0
+        if kv_cache is not None:
+            pos_offset = kv_cache[2]
         cos = self.cos.to(x.device)
         sin = self.sin.to(x.device)
         q, k = apply_rope(q, k, cos, sin, pos_offset)
@@ -96,15 +97,9 @@ class CausalAttention(nn.Module):
             out = torch.einsum('bhqk,bhkd->bhqd', F.softmax(attn, dim=-1), v_buf)
             new_cache = (k_buf, v_buf, new_len)
         else:
-            # JAX dot_product_attention expects (B, T, H, D) but receives (B, H, T, D).
-            # The model was trained with this convention — attention between heads
-            # per position, not between positions per head. Replicate in PyTorch by
-            # transposing to (B, T, H, D) before SDPA (which expects B, num_heads, L, D).
-            q_swap = q.transpose(1, 2)   # (B, H, T, D) -> (B, T, H, D)
-            k_swap = k.transpose(1, 2)
-            v_swap = v.transpose(1, 2)
-            out = F.scaled_dot_product_attention(q_swap, k_swap, v_swap, is_causal=True)
-            out = out.transpose(1, 2)    # back to (B, H, T, D)
+            # Standard cross-position causal attention.
+            # New 2.2B checkpoints (post-attention-fix) use this.
+            out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
             new_cache = None
 
         out = out.transpose(1, 2).reshape(B, T, C)
@@ -130,8 +125,8 @@ class TransformerBlock(nn.Module):
         self.ln2 = RMSNorm(n_embd)
         self.ffn = SwiGLU(n_embd, ffn_hidden, make_linear)
 
-    def forward(self, x, kv_cache=None):
-        attn_out, new_cache = self.attn(self.ln1(x), kv_cache)
+    def forward(self, x, kv_cache=None, pos_offset=0):
+        attn_out, new_cache = self.attn(self.ln1(x), kv_cache, pos_offset=pos_offset)
         x = x + attn_out
         x = x + self.ffn(self.ln2(x))
         return x, new_cache
@@ -152,12 +147,12 @@ class PackedGPT(nn.Module):
         ])
         self.ln_f = RMSNorm(n_embd)
 
-    def forward(self, idx, kv_caches=None):
+    def forward(self, idx, kv_caches=None, pos_offset=0):
         x = self.embedding(idx)
         new_caches = []
         for i, block in enumerate(self.blocks):
             cache = kv_caches[i] if kv_caches is not None else None
-            x, new_cache = block(x, cache)
+            x, new_cache = block(x, cache, pos_offset=pos_offset)
             new_caches.append(new_cache)
         x = self.ln_f(x)
         logits = x.to(self.embedding.weight.dtype) @ self.embedding.weight.T

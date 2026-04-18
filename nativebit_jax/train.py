@@ -29,7 +29,7 @@ from jax.sharding import Mesh, PartitionSpec as P, NamedSharding
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from nativebit_jax.model import build_model, NativeBitGPT, apply_init_scaling
-from nativebit_jax.codebook_utils import ema_update_codebooks, revive_dead_entries
+from nativebit_jax.codebook_utils import ema_update_codebooks
 from nativebit_jax.layers import NativeBitDense
 
 
@@ -225,61 +225,38 @@ def _ema_update_params(params, intermediates, decay: float = 0.99):
     return {**params, "params": new_params}
 
 
-def _revive_all(state, model, real_batch: jnp.ndarray):
-    """Revive dead codebook entries across all NativeBitDense layers.
-
-    Uses requantize_params to get current indices, then revives dead entries.
-    """
-    import math
-    from nativebit_jax.layers import requantize_params
-
-    # Get current indices via external requantize
-    _, intermediates = requantize_params(state.params)
-    # Wrap to match expected format
-    updates = {"intermediates": intermediates}
-    inter = updates.get("intermediates", {})
-
-    def _walk_revive(params_node, inter_node):
-        if isinstance(params_node, dict):
-            if "codebook" in params_node and "weight" in params_node:
-                codebook = params_node["codebook"]
-                num_blocks, n_entries = codebook.shape
-                inter = inter_node if isinstance(inter_node, dict) else {}
-                indices = inter.get("indices", None)
-                if indices is not None:
-                    if isinstance(indices, (list, tuple)):
-                        indices = indices[-1]
-                    # Compute utilization from indices
-                    one_hot = jax.nn.one_hot(indices, n_entries)
-                    utilization = one_hot.sum(axis=1).astype(jnp.int32)
-                    new_cb, n_dead = revive_dead_entries(codebook, utilization)
-                    if n_dead > 0:
-                        return {**params_node, "codebook": new_cb}
-                return params_node
-            result = {}
-            for k, v in params_node.items():
-                inter_child = inter_node.get(k, {}) if isinstance(inter_node, dict) else {}
-                result[k] = _walk_revive(v, inter_child)
-            return result
-        return params_node
-
-    inter_dict = inter.get("params", inter) if isinstance(inter, dict) else {}
-    new_p = _walk_revive(state.params["params"], inter_dict)
-    new_params = {**state.params, "params": new_p}
-    return state.replace(params=new_params)
-
-
-def make_train_step(model: NativeBitGPT):
+def make_train_step(model: NativeBitGPT, use_quant_reg: bool = False):
     """Create a single jit-compiled train step.
 
     Same function for float and NativeBit — no branching. NativeBit layers
     read cached deltas; cache is updated externally by requantize_params().
+
+    If use_quant_reg=True, adds lam * mean(||w - sg(Q(w))||^2) to the loss.
+    Lam is passed per-step so the schedule can vary during training.
     """
+    from nativebit_jax.layers import compute_quant_reg
+
+    if use_quant_reg:
+        @jax.jit
+        def train_step(state, x, y, lam):
+            def loss_fn(params):
+                logits = model.apply(params, x)
+                ce = optax.softmax_cross_entropy_with_integer_labels(
+                    logits.reshape(-1, logits.shape[-1]),
+                    y.reshape(-1),
+                ).mean()
+                reg = compute_quant_reg(params)
+                return ce + lam * reg, (ce, reg)
+            (loss, (ce, reg)), grads = jax.value_and_grad(
+                loss_fn, has_aux=True)(state.params)
+            state = state.apply_gradients(grads=grads)
+            return state, ce, reg
+
+        return train_step
+
     @jax.jit
     def train_step(state, x, y):
         def loss_fn(params):
-            # No mutable — cache is read-only during forward.
-            # Cache updates happen externally via requantize_params().
             logits = model.apply(params, x)
             loss = optax.softmax_cross_entropy_with_integer_labels(
                 logits.reshape(-1, logits.shape[-1]),
@@ -360,9 +337,43 @@ def _get_gcs_bucket():
     return bucket
 
 
+def _get_git_hash():
+    """Best-effort git HEAD sha; '' if not a git repo or git unavailable."""
+    import subprocess
+    try:
+        r = subprocess.run(["git", "rev-parse", "HEAD"],
+                           capture_output=True, text=True, timeout=3,
+                           cwd=str(Path(__file__).resolve().parent.parent))
+        return r.stdout.strip() if r.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+def _config_to_dict(config):
+    """Dump config class attributes (supports dataclasses and plain classes)."""
+    try:
+        from dataclasses import is_dataclass, asdict
+        if is_dataclass(config):
+            return asdict(config)
+    except Exception:
+        pass
+    out = {}
+    for k in dir(config):
+        if k.startswith("_"):
+            continue
+        v = getattr(config, k, None)
+        if callable(v):
+            continue
+        if isinstance(v, (int, float, str, bool, type(None))):
+            out[k] = v
+    return out
+
+
 def train(config, use_nativebit: bool = True, use_aqt: bool = False,
           experiment_name: str = "nativebit_jax",
-          log_dir: str = "logs", data_dir: str = "data"):
+          log_dir: str = "logs", data_dir: str = "data",
+          init_from: str = None, val_every: int = 1000,
+          argv: list = None):
     """Run training."""
     print(f"\n=== {experiment_name} (JAX/Flax) ===")
     print(f"  Device: {jax.devices()[0]}")
@@ -415,6 +426,71 @@ def train(config, use_nativebit: bool = True, use_aqt: bool = False,
         from nativebit_jax.layers import requantize_params
         params, _ = requantize_params(params)
 
+        # If using canonical VQ-VAE EMA, seed `ema_s` with current codebook
+        # values and `ema_N` with ones so that s/N = cb_init at step 0.
+        if getattr(config, "use_canonical_ema", False):
+            from nativebit_jax.layers import init_canonical_ema_state
+            params = init_canonical_ema_state(params)
+
+    # QAT: load weights from a pre-trained checkpoint BEFORE training starts.
+    # Codebooks are then re-initialised from those loaded weights so the
+    # quantizer is fitted to the real trained distribution, not random init.
+    #
+    # Handles the format mismatch between float-trained checkpoints (Flax
+    # nn.Dense uses "Dense_N/kernel" with shape (in, out)) and NB-trained
+    # checkpoints ("NativeBitDense_N/weight" with shape (out, in)).
+    if init_from is not None:
+        print(f"  QAT init: loading weights from {init_from}", flush=True)
+        import numpy as np
+        ckpt_data = np.load(init_from)
+        ckpt_keys = set(ckpt_data.files)
+        loaded_keys = set()
+
+        def _candidate_keys(path_str: str, leaf_shape):
+            """Yield (ckpt_key, needs_transpose) candidates for a param."""
+            yield path_str, False
+            if "/NativeBitDense_" in path_str and path_str.endswith("/weight"):
+                translated = (path_str.replace("/NativeBitDense_", "/Dense_")
+                              .replace("/weight", "/kernel"))
+                yield translated, True
+
+        def _load_leaf(path, leaf):
+            key = "/".join(str(p.key) if hasattr(p, 'key') else str(p) for p in path)
+            for cand, needs_transpose in _candidate_keys(key, leaf.shape):
+                if cand in ckpt_keys:
+                    arr = np.asarray(ckpt_data[cand])
+                    if needs_transpose:
+                        arr = arr.T
+                    if arr.shape != leaf.shape:
+                        print(f"    WARNING: shape mismatch for {key}: "
+                              f"ckpt has {arr.shape}, expected {leaf.shape} "
+                              f"(from {cand}). Skipping.", flush=True)
+                        return leaf
+                    loaded_keys.add(key)
+                    return jnp.array(arr)
+            return leaf
+
+        params = jax.tree_util.tree_map_with_path(_load_leaf, params)
+
+        total_leaves = sum(1 for _ in jax.tree_util.tree_leaves(params))
+        print(f"  QAT init: loaded {len(loaded_keys)}/{total_leaves} leaves",
+              flush=True)
+        if len(loaded_keys) < total_leaves * 0.1:
+            raise RuntimeError(
+                f"QAT init loaded only {len(loaded_keys)}/{total_leaves} "
+                f"leaves — checkpoint format probably doesn't match. "
+                f"Sample ckpt keys: {list(ckpt_keys)[:5]}")
+        del ckpt_data; import gc; gc.collect()
+
+        # Re-init codebooks from LOADED weights, then repopulate cache.
+        if use_nativebit:
+            params = jax.tree_util.tree_map_with_path(_reinit_cb, params)
+            params, _ = requantize_params(params)
+            if getattr(config, "use_canonical_ema", False):
+                from nativebit_jax.layers import init_canonical_ema_state
+                params = init_canonical_ema_state(params)
+        print(f"  QAT init: done.", flush=True)
+
     # FSDP sharding (auto-enabled on multi-device)
     params, mesh = setup_fsdp(params)
     import gc; gc.collect()  # Free pre-shard allocations
@@ -445,24 +521,43 @@ def train(config, use_nativebit: bool = True, use_aqt: bool = False,
     # Compile train step (single function — no branching)
     ema_decay = getattr(config, "ema_decay", 0.999)
     requantize_every = getattr(config, "requantize_every", 10)
-    train_step_fn = make_train_step(model)
+    quant_reg_weight = getattr(config, "quant_reg_weight", 0.0) if use_nativebit else 0.0
+    quant_reg_warmup_frac = getattr(config, "quant_reg_warmup_frac", 0.25)
+    use_quant_reg = quant_reg_weight > 0.0
+    use_canonical_ema = getattr(config, "use_canonical_ema", False) and use_nativebit
+    train_step_fn = make_train_step(model, use_quant_reg=use_quant_reg)
+
+    def lambda_schedule(step: int) -> float:
+        """Linear warmup from 0 to quant_reg_weight over warmup_frac of training."""
+        if not use_quant_reg:
+            return 0.0
+        warmup_steps = max(int(config.max_steps * quant_reg_warmup_frac), 1)
+        return quant_reg_weight * min(1.0, step / warmup_steps)
 
     # Logger
     log_path = Path(log_dir)
     log_path.mkdir(parents=True, exist_ok=True)
     jsonl_path = log_path / f"{experiment_name}.jsonl"
 
-    # Write header
+    # Write header (schema v2: adds git_hash, argv, full config, init_from)
     with open(jsonl_path, "a") as f:
         header = {
-            "type": "header", "backend": "jax",
-            "max_steps": config.max_steps,
+            "type": "header", "schema_version": 2, "backend": "jax",
             "use_nativebit": use_nativebit,
+            "dataset": dataset,
+            "config": _config_to_dict(config),
+            "git_hash": _get_git_hash(),
+            "argv": argv or [],
+            "init_from": init_from,
+            # Redundant top-level copies for quick grep (kept for back-compat):
+            "max_steps": config.max_steps,
             "n_codebook": config.n_codebook,
             "block_size": config.block_size,
             "batch_size": config.batch_size,
             "lr": config.lr,
-            "dataset": dataset,
+            "quant_reg_weight": quant_reg_weight,
+            "quant_reg_warmup_frac": quant_reg_warmup_frac,
+            "use_canonical_ema": use_canonical_ema,
         }
         f.write(json.dumps(header) + "\n")
 
@@ -475,12 +570,20 @@ def train(config, use_nativebit: bool = True, use_aqt: bool = False,
 
     # Use a copy — don't corrupt the real state
     pf_state = state
-    pf_state, _ = train_step_fn(pf_state, preflight_x, preflight_y)  # compile
+    if use_quant_reg:
+        pf_state, *_ = train_step_fn(pf_state, preflight_x, preflight_y,
+                                     jnp.float32(0.0))  # compile
+    else:
+        pf_state, _ = train_step_fn(pf_state, preflight_x, preflight_y)
     jax.block_until_ready(pf_state)
 
     t0 = time.time()
     for _ in range(50):
-        pf_state, _ = train_step_fn(pf_state, preflight_x, preflight_y)
+        if use_quant_reg:
+            pf_state, *_ = train_step_fn(pf_state, preflight_x, preflight_y,
+                                         jnp.float32(0.0))
+        else:
+            pf_state, _ = train_step_fn(pf_state, preflight_x, preflight_y)
     jax.block_until_ready(pf_state)
     t1 = time.time()
     preflight_sps = 50 / (t1 - t0)
@@ -537,14 +640,52 @@ def train(config, use_nativebit: bool = True, use_aqt: bool = False,
         del ckpt_data, restored_params; gc.collect()
         print(f"  Resumed at step {resume_step}")
 
+    # --- Initial eval (BEFORE any training step) -----------------------------
+    # For QAT, this is the "post-hoc RTN" baseline at the loaded weights.
+    # For from-scratch, it's a sanity check that the init is sensible.
+    eval_step_fn = make_eval_step(model)
+
+    def _eval_subset(tokens, max_batches: int = None):
+        rng = jax.random.PRNGKey(0)
+        total, n = 0.0, 0
+        for xb, yb in make_batches(tokens, config.context_len,
+                                   config.batch_size, rng):
+            xb, yb = _to_device(xb, yb)
+            total += float(eval_step_fn(state.params, xb, yb))
+            n += 1
+            if max_batches and n >= max_batches:
+                break
+        return (total / max(n, 1), n)
+
+    if resume_step == 0:
+        # Make sure cache reflects current weights before eval (for QAT from float).
+        if use_nativebit:
+            from nativebit_jax.layers import requantize_params
+            fresh_params, _ = requantize_params(
+                state.params, ema_decay, use_canonical_ema=use_canonical_ema)
+            state = state.replace(params=fresh_params)
+
+        init_loss, init_n = _eval_subset(valid_tokens, max_batches=64)
+        init_ppl = math.exp(min(init_loss, 20))
+        print(f"  Initial validation PPL (step 0, {init_n} batches): "
+              f"{init_ppl:.2f}", flush=True)
+        with open(jsonl_path, "a") as f:
+            f.write(json.dumps({
+                "type": "init_eval", "step": 0,
+                "val_ppl": round(init_ppl, 2),
+                "val_loss": round(init_loss, 6),
+                "val_batches": init_n,
+            }) + "\n")
+
     # --- Main loop ---
+    from nativebit_jax.layers import compute_quant_diagnostics
+    _diag_jitted = jax.jit(compute_quant_diagnostics) if use_nativebit else None
+
     step = resume_step
     start_time = time.time()
     last_log_time = start_time
     last_log_step = step
     epoch = 0
-    last_batch = None  # Track last real batch for revival
-    last_updates = None  # Cache intermediates for inter-requantize EMA
 
     while step < config.max_steps:
         epoch += 1
@@ -562,18 +703,19 @@ def train(config, use_nativebit: bool = True, use_aqt: bool = False,
 
             if need_requantize:
                 from nativebit_jax.layers import requantize_params
-                new_params, _ = requantize_params(state.params, ema_decay)
+                new_params, _ = requantize_params(
+                    state.params, ema_decay,
+                    use_canonical_ema=use_canonical_ema)
                 state = state.replace(params=new_params)
                 jax.block_until_ready(state)  # force XLA to free old buffers
 
-            state, loss = train_step_fn(state, x_batch, y_batch)
-
-            last_batch = x_batch  # keep for revival
-
-            # Dead entry revival (outside jit, every revive_every steps)
-            if (use_nativebit and step > 0
-                    and step % config.revive_every == 0):
-                state = _revive_all(state, model, last_batch)
+            if use_quant_reg:
+                lam = jnp.float32(lambda_schedule(step))
+                state, ce_loss, reg_loss = train_step_fn(state, x_batch, y_batch, lam)
+                loss = ce_loss  # what we log as training loss / use for PPL
+            else:
+                state, loss = train_step_fn(state, x_batch, y_batch)
+                ce_loss, reg_loss = loss, jnp.float32(0.0)
 
             if step % config.log_every == 0:
                 loss_val = float(loss)
@@ -592,6 +734,22 @@ def train(config, use_nativebit: bool = True, use_aqt: bool = False,
                     "elapsed_s": round(elapsed, 1),
                     "steps_per_sec": round(instant_sps, 1),
                 }
+                if use_quant_reg:
+                    record["quant_reg"] = round(float(reg_loss), 8)
+                    record["lambda"] = round(float(lam), 6)
+                # Quantization diagnostics — computed lazily, log every N steps
+                # (cheap: one argmin pass over params, reuses jit cache).
+                if _diag_jitted is not None:
+                    diag = _diag_jitted(state.params)
+                    record["quant_err_rms"] = round(float(diag["quant_error_rms"]), 6)
+                    record["cb_utilization"] = round(float(diag["codebook_utilization"]), 4)
+                    record["dead_frac"] = round(float(diag["dead_entries_frac"]), 4)
+                # Periodic validation on held-out valid set (small subset for speed)
+                if step > 0 and step % val_every == 0:
+                    v_loss, v_n = _eval_subset(valid_tokens, max_batches=32)
+                    record["val_loss"] = round(v_loss, 6)
+                    record["val_ppl"] = round(math.exp(min(v_loss, 20)), 2)
+                    record["val_batches"] = v_n
                 with open(jsonl_path, "a") as f:
                     f.write(json.dumps(record) + "\n")
 
@@ -601,8 +759,17 @@ def train(config, use_nativebit: bool = True, use_aqt: bool = False,
                     subprocess.Popen(f"gsutil -q cp {jsonl_path} {gcs_bucket}/",
                                      shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
+                extra = ""
+                if use_quant_reg:
+                    extra += (f"  reg={float(reg_loss):.2e}"
+                              f"  lam={float(lam):.4f}")
+                if "quant_err_rms" in record:
+                    extra += (f"  qerr={record['quant_err_rms']:.4f}"
+                              f"  util={record['cb_utilization']:.3f}")
+                if "val_ppl" in record:
+                    extra += f"  val_ppl={record['val_ppl']:.2f}"
                 print(f"  step={step:>5d}  loss={loss_val:.4f}  ppl={ppl:>10.2f}  "
-                      f"sps={instant_sps:.1f}", flush=True)
+                      f"sps={instant_sps:.1f}{extra}", flush=True)
 
                 # Fast fail
                 if math.isnan(loss_val) or loss_val > 1000:
@@ -640,6 +807,14 @@ def train(config, use_nativebit: bool = True, use_aqt: bool = False,
                 break
 
     # --- Eval ---
+    # Refresh cached qw_delta from current latent weights so eval uses true
+    # Q(w_final) instead of a stale delta up to `requantize_every` steps old.
+    if use_nativebit:
+        from nativebit_jax.layers import requantize_params
+        fresh_params, _ = requantize_params(
+            state.params, ema_decay, use_canonical_ema=use_canonical_ema)
+        state = state.replace(params=fresh_params)
+
     print(f"\nEval...")
     eval_step_fn = make_eval_step(model)
     eval_rng = jax.random.PRNGKey(0)
@@ -708,6 +883,33 @@ def main():
                         help="Use AQT INT8 matmuls (requires aqt package)")
     parser.add_argument("--batch-size", type=int, default=None,
                         help="Override config batch_size (for memory-constrained TPUs)")
+    parser.add_argument("--quant-reg-weight", type=float, default=None,
+                        help="VQ-VAE-style commitment loss weight (pulls w "
+                             "toward nearest codebook entry). 0 = disabled.")
+    parser.add_argument("--quant-reg-warmup-frac", type=float, default=None,
+                        help="Fraction of training to linearly warm lam from 0 "
+                             "to quant_reg_weight (default from config).")
+    parser.add_argument("--use-canonical-ema", action="store_true",
+                        help="Canonical VQ-VAE EMA: EMA raw sums and counts, "
+                             "then derive codebook = s/N. Default is "
+                             "EMA-of-batch-means.")
+    parser.add_argument("--init-from", type=str, default=None,
+                        help="Path to an .npz checkpoint to initialise weights "
+                             "from (e.g. a trained float baseline, for QAT). "
+                             "Codebooks are re-initialised from the loaded "
+                             "weight distribution.")
+    parser.add_argument("--val-every", type=int, default=1000,
+                        help="Run validation PPL every N steps (default 1000).")
+    parser.add_argument("--warmup-steps", type=int, default=None,
+                        help="Override LR warmup steps (default from config).")
+    parser.add_argument("--delay-quant-steps", type=int, default=None,
+                        help="Override delay_quant_steps. Set to 0 for QAT "
+                             "from a trained float checkpoint so quantization "
+                             "is active from step 0.")
+    parser.add_argument("--ema-decay", type=float, default=None,
+                        help="Override codebook EMA decay (default 0.999). "
+                             "Lower values = faster adapt, useful for short "
+                             "QAT runs.")
     args = parser.parse_args()
 
     from configs.default import DefaultConfig
@@ -729,11 +931,24 @@ def main():
         config.max_steps = args.max_steps
     if args.batch_size is not None:
         config.batch_size = args.batch_size
+    if args.quant_reg_weight is not None:
+        config.quant_reg_weight = args.quant_reg_weight
+    if args.quant_reg_warmup_frac is not None:
+        config.quant_reg_warmup_frac = args.quant_reg_warmup_frac
+    if args.use_canonical_ema:
+        config.use_canonical_ema = True
+    if args.warmup_steps is not None:
+        config.warmup_steps = args.warmup_steps
+    if args.delay_quant_steps is not None:
+        config.delay_quant_steps = args.delay_quant_steps
+    if args.ema_decay is not None:
+        config.ema_decay = args.ema_decay
     config.seed = args.seed
 
     use_nativebit = not args.no_nativebit
     train(config, use_nativebit=use_nativebit, use_aqt=args.use_aqt,
-          experiment_name=args.name, log_dir=args.log_dir, data_dir=args.data_dir)
+          experiment_name=args.name, log_dir=args.log_dir, data_dir=args.data_dir,
+          init_from=args.init_from, val_every=args.val_every, argv=sys.argv)
 
 
 if __name__ == "__main__":

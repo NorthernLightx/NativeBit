@@ -88,8 +88,9 @@ def pack_checkpoint(ckpt_path, out_path, block_size=128, n_entries=8):
             continue  # Skip quantized weights (replaced by indices)
         if k.endswith("/codebook"):
             continue  # Codebooks stored separately
-        # Skip cached deltas
-        if "/qw_delta" in k:
+        # Skip training-only state: cached deltas and canonical-EMA running stats.
+        # None of these are needed at inference.
+        if any(tag in k for tag in ("/qw_delta", "/ema_N", "/ema_s")):
             continue
         non_quant_keys.append(k)
 
@@ -148,8 +149,10 @@ def pack_checkpoint(ckpt_path, out_path, block_size=128, n_entries=8):
     save_dict["__metadata__"] = np.array([block_size, n_entries, len(quantized), len(non_quant_keys)])
 
     np.savez_compressed(out_path, **save_dict)
-    actual_size = os.path.getsize(out_path)
-    print(f"\n  Saved: {out_path} ({actual_size / 1e9:.2f} GB on disk)")
+    # np.savez_compressed appends .npz if the path doesn't already end with it
+    final_path = out_path if out_path.endswith(".npz") else out_path + ".npz"
+    actual_size = os.path.getsize(final_path)
+    print(f"\n  Saved: {final_path} ({actual_size / 1e9:.2f} GB on disk)")
     print(f"  Compression vs fp32: {sum(ckpt[k].nbytes for k in keys) / actual_size:.1f}x")
 
 

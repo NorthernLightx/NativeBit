@@ -27,7 +27,6 @@ class LargeConfig:
     warmup_steps: int = 1000
     grad_clip: float = 1.0
     codebook_grad_clip: float = 1.0
-    revive_every: int = 100
     log_every: int = 100
     checkpoint_every: int = 5000
     weight_decay: float = 0.05

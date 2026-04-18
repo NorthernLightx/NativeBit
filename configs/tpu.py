@@ -25,7 +25,6 @@ class TPUSmallConfig:
     warmup_steps: int = 500
     grad_clip: float = 1.0
     codebook_grad_clip: float = 1.0
-    revive_every: int = 25
     log_every: int = 50
     weight_decay: float = 0.01
 
@@ -52,12 +51,20 @@ class TPUMediumConfig:
     warmup_steps: int = 2000
     grad_clip: float = 1.0
     codebook_grad_clip: float = 1.0
-    revive_every: int = 50
     log_every: int = 100
     weight_decay: float = 0.1
     delay_quant_steps: int = 500  # Train as float for first 500 steps
     ema_decay: float = 0.999
     requantize_every: int = 10
+    # VQ-VAE commitment loss: pulls w toward nearest codebook entry.
+    # Reg is normalized by n_layers, so lam ~ 0.1-10 is a reasonable range
+    # (gradient per weight ~ 2*drift/n_layers, comparable to CE grad).
+    quant_reg_weight: float = 0.0
+    quant_reg_warmup_frac: float = 0.25
+    # Canonical VQ-VAE EMA: EMA the raw sums and counts per entry, then
+    # derive codebook as s/N. Our default is EMA-of-means which weights
+    # noisy low-count batches equally. Canonical is count-weighted.
+    use_canonical_ema: bool = False
 
     dataset: str = "wikitext-103"
     seed: int = 42
@@ -82,12 +89,20 @@ class TPULargeConfig:
     warmup_steps: int = 1000
     grad_clip: float = 1.0
     codebook_grad_clip: float = 1.0
-    revive_every: int = 100
     log_every: int = 100
     weight_decay: float = 0.1
     delay_quant_steps: int = 500
     ema_decay: float = 0.999
     requantize_every: int = 10
+    # VQ-VAE commitment loss: pulls w toward nearest codebook entry.
+    # Reg is normalized by n_layers, so lam ~ 0.1-10 is a reasonable range
+    # (gradient per weight ~ 2*drift/n_layers, comparable to CE grad).
+    quant_reg_weight: float = 0.0
+    quant_reg_warmup_frac: float = 0.25
+    # Canonical VQ-VAE EMA: EMA the raw sums and counts per entry, then
+    # derive codebook as s/N. Our default is EMA-of-means which weights
+    # noisy low-count batches equally. Canonical is count-weighted.
+    use_canonical_ema: bool = False
 
     dataset: str = "wikitext-103"
     seed: int = 42
@@ -112,7 +127,6 @@ class TPUXLConfig:
     warmup_steps: int = 5000
     grad_clip: float = 1.0
     codebook_grad_clip: float = 1.0
-    revive_every: int = 200
     log_every: int = 100
     weight_decay: float = 0.1
 
@@ -143,13 +157,27 @@ class TPU2BConfig:
     warmup_steps: int = 1000
     grad_clip: float = 1.0
     codebook_grad_clip: float = 1.0
-    revive_every: int = 500
     log_every: int = 100
     weight_decay: float = 0.1
     delay_quant_steps: int = 500
     ema_decay: float = 0.999
-    requantize_every: int = 200
+    # requantize_every=200 was too sparse: at peak LR, weights drift past
+    # codebook spacing within one cycle, so the STE forward uses increasingly
+    # stale quantized values. 125M/350M use 10 and match float; 2.2B used 200
+    # and lagged +15.7%. Changed to 10 to match the smaller scales.
+    # Cost: ~15% slower training. Worth it if it recovers PPL.
+    requantize_every: int = 10
     checkpoint_every: int = 1000
+
+    # VQ-VAE commitment loss: pulls w toward nearest codebook entry.
+    # Reg is normalized by n_layers, so lam ~ 0.1-10 is a reasonable range
+    # (gradient per weight ~ 2*drift/n_layers, comparable to CE grad).
+    quant_reg_weight: float = 0.0
+    quant_reg_warmup_frac: float = 0.25
+    # Canonical VQ-VAE EMA: EMA the raw sums and counts per entry, then
+    # derive codebook as s/N. Our default is EMA-of-means which weights
+    # noisy low-count batches equally. Canonical is count-weighted.
+    use_canonical_ema: bool = False
 
     dataset: str = "wikitext-103"
     seed: int = 42
