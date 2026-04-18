@@ -40,9 +40,11 @@ class TestNativeBitLinear:
         loss = out.sum()
         loss.backward()
 
-        # Gradients should flow to both weight and codebook
+        # STE: gradients flow to latent weight and input, but NOT to the
+        # codebook — the codebook is updated separately (EMA / dedicated loss).
+        # See layers.py: `(Q(w) - w).detach()` blocks grad through the gather.
         assert layer.weight.grad is not None
-        assert layer.codebook.grad is not None
+        assert layer.codebook.grad is None
         assert x.grad is not None
 
     def test_quantized_output_uses_codebook_values(self):
