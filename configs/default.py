@@ -22,7 +22,6 @@ class DefaultConfig:
     warmup_steps: int = 200
     grad_clip: float = 1.0
     codebook_grad_clip: float = 1.0
-    revive_every: int = 25
     log_every: int = 50
     weight_decay: float = 0.01
 

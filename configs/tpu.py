@@ -25,7 +25,6 @@ class TPUSmallConfig:
     warmup_steps: int = 500
     grad_clip: float = 1.0
     codebook_grad_clip: float = 1.0
-    revive_every: int = 25
     log_every: int = 50
     weight_decay: float = 0.01
 
@@ -52,7 +51,6 @@ class TPUMediumConfig:
     warmup_steps: int = 2000
     grad_clip: float = 1.0
     codebook_grad_clip: float = 1.0
-    revive_every: int = 50
     log_every: int = 100
     weight_decay: float = 0.1
     delay_quant_steps: int = 500  # Train as float for first 500 steps
@@ -91,7 +89,6 @@ class TPULargeConfig:
     warmup_steps: int = 1000
     grad_clip: float = 1.0
     codebook_grad_clip: float = 1.0
-    revive_every: int = 100
     log_every: int = 100
     weight_decay: float = 0.1
     delay_quant_steps: int = 500
@@ -130,7 +127,6 @@ class TPUXLConfig:
     warmup_steps: int = 5000
     grad_clip: float = 1.0
     codebook_grad_clip: float = 1.0
-    revive_every: int = 200
     log_every: int = 100
     weight_decay: float = 0.1
 
@@ -161,7 +157,6 @@ class TPU2BConfig:
     warmup_steps: int = 1000
     grad_clip: float = 1.0
     codebook_grad_clip: float = 1.0
-    revive_every: int = 500
     log_every: int = 100
     weight_decay: float = 0.1
     delay_quant_steps: int = 500

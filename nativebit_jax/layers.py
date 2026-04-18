@@ -472,6 +472,86 @@ def _init_codebook_from_weight(weight, block_size, num_blocks, total_weights,
     return jnp.quantile(w_blocks.astype(jnp.float32), q, axis=1).T
 
 
+def compute_quant_diagnostics(params):
+    """Per-step quantization health metrics across all NativeBit layers.
+
+    Pure function — call from anywhere (CPU/GPU/TPU) without side effects.
+    Designed for experiment logs; no framework-specific state.
+
+    Returns a plain dict of scalars:
+      quant_error_rms     -- sqrt(mean ||w - Q(w)||^2) over all NB weights.
+                             This is what STE pretends is zero; commitment
+                             loss directly drives it down.
+      codebook_utilization -- fraction of (block, entry) pairs that received
+                              at least one weight assignment at the most
+                              recent argmin. 1.0 = every entry used.
+      dead_entries_frac   -- 1 - codebook_utilization (frozen entries).
+      n_nb_layers         -- how many NB layers were scanned.
+
+    All arithmetic is float32. Safe to call every log step.
+    """
+    params_inner = params.get("params", params)
+
+    total_sq_err = jnp.float32(0.0)
+    total_weights = 0
+    total_active = 0
+    total_entries = 0
+    n_layers = 0
+
+    def _walk(node):
+        nonlocal total_sq_err, total_weights, total_active, total_entries, n_layers
+        if isinstance(node, dict):
+            if "codebook" in node and "weight" in node:
+                w = node["weight"].astype(jnp.float32)
+                cb = node["codebook"].astype(jnp.float32)
+
+                num_blocks, n_entries = cb.shape
+                tw = w.size
+                bs = math.ceil(tw / num_blocks)
+                padded = num_blocks * bs
+
+                w_flat = w.reshape(-1)
+                if padded > tw:
+                    w_flat = jnp.pad(w_flat, (0, padded - tw))
+                w_blocks = w_flat.reshape(num_blocks, bs)
+
+                d_sq = (w_blocks[:, :, None] - cb[:, None, :]) ** 2
+                indices = d_sq.argmin(axis=-1)
+                min_d_sq = d_sq.min(axis=-1)
+
+                if padded > tw:
+                    flat_idx = jnp.arange(padded)
+                    valid = (flat_idx < tw).reshape(num_blocks, bs)
+                    min_d_sq = jnp.where(valid, min_d_sq, 0.0)
+
+                total_sq_err = total_sq_err + min_d_sq.sum()
+                total_weights += tw
+
+                one_hot = jax.nn.one_hot(indices, n_entries)
+                counts = one_hot.sum(axis=1)
+                total_active = total_active + (counts > 0).sum()
+                total_entries += num_blocks * n_entries
+                n_layers += 1
+            else:
+                for k, v in node.items():
+                    _walk(v)
+
+    _walk(params_inner)
+
+    if n_layers == 0:
+        return {"quant_error_rms": 0.0, "codebook_utilization": 1.0,
+                "dead_entries_frac": 0.0, "n_nb_layers": 0}
+
+    rms = jnp.sqrt(total_sq_err / jnp.float32(max(total_weights, 1)))
+    util = total_active.astype(jnp.float32) / jnp.float32(max(total_entries, 1))
+    return {
+        "quant_error_rms": rms,
+        "codebook_utilization": util,
+        "dead_entries_frac": 1.0 - util,
+        "n_nb_layers": n_layers,
+    }
+
+
 def compute_quant_reg(params):
     """VQ-VAE-style commitment loss for NativeBit layers.
 
