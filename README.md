@@ -90,9 +90,21 @@ python benchmarks/benchmark_posthoc_2b.py --ckpt logs/2b_float_params.npz
 
 ## Training logs
 
-Each run writes a JSONL log. The header (`schema_version=2`) records the full config, the git hash, the argv, and any `init_from` path. Before training starts, an `init_eval` record captures validation PPL at step 0 — for QAT this is the post-hoc baseline at the loaded weights. Every `log_every` steps emits loss, perplexity, `quant_err_rms`, codebook utilization, dead-entry fraction, and (if commitment loss is on) `quant_reg` and `lambda`. Every `val_every` steps adds a held-out validation PPL. The final `eval` record has test PPL on the training dataset plus a cross-eval on WikiText-103.
+Each run writes a JSONL log. Example records (one of each type):
 
-`compute_quant_diagnostics(params)` in `layers.py` is a pure function you can call from anywhere to get `{quant_error_rms, codebook_utilization, dead_entries_frac}`. Useful for experiment monitoring.
+```jsonl
+{"type": "header", "schema_version": 2, "git_hash": "658c381", "argv": [...], "config": {...}, "init_from": "logs/2b_float_params.npz"}
+{"type": "init_eval", "step": 0, "val_ppl": 18.98, "val_loss": 2.94, "val_batches": 64}
+{"step": 100, "loss": 6.55, "perplexity": 697.9, "quant_err_rms": 0.0036, "cb_utilization": 1.0, "dead_frac": 0.0, "quant_reg": 57.5, "lambda": 0.08}
+{"step": 500, "loss": 4.82, "val_ppl": 128.0, "val_batches": 32}
+{"type": "eval", "test_ppl": 18.40, "wt103_test_ppl": 30.50, "total_time_s": 7400.0}
+```
+
+- `quant_reg` and `lambda` appear only when commitment loss is on.
+- `val_ppl`, `val_loss`, `val_batches` appear on per-step records at `step % val_every == 0`.
+- Everything in the header is JSON-serialisable, including the full dataclass config.
+
+`compute_quant_diagnostics(params)` in `layers.py` is a pure function returning `{quant_error_rms, codebook_utilization, dead_entries_frac}` for any params tree. Useful for ad-hoc monitoring outside the training loop.
 
 ## Inference
 
