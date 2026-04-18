@@ -58,6 +58,15 @@ class TPUMediumConfig:
     delay_quant_steps: int = 500  # Train as float for first 500 steps
     ema_decay: float = 0.999
     requantize_every: int = 10
+    # VQ-VAE commitment loss: pulls w toward nearest codebook entry.
+    # Reg is normalized by n_layers, so lam ~ 0.1-10 is a reasonable range
+    # (gradient per weight ~ 2*drift/n_layers, comparable to CE grad).
+    quant_reg_weight: float = 0.0
+    quant_reg_warmup_frac: float = 0.25
+    # Canonical VQ-VAE EMA: EMA the raw sums and counts per entry, then
+    # derive codebook as s/N. Our default is EMA-of-means which weights
+    # noisy low-count batches equally. Canonical is count-weighted.
+    use_canonical_ema: bool = False
 
     dataset: str = "wikitext-103"
     seed: int = 42
@@ -88,6 +97,15 @@ class TPULargeConfig:
     delay_quant_steps: int = 500
     ema_decay: float = 0.999
     requantize_every: int = 10
+    # VQ-VAE commitment loss: pulls w toward nearest codebook entry.
+    # Reg is normalized by n_layers, so lam ~ 0.1-10 is a reasonable range
+    # (gradient per weight ~ 2*drift/n_layers, comparable to CE grad).
+    quant_reg_weight: float = 0.0
+    quant_reg_warmup_frac: float = 0.25
+    # Canonical VQ-VAE EMA: EMA the raw sums and counts per entry, then
+    # derive codebook as s/N. Our default is EMA-of-means which weights
+    # noisy low-count batches equally. Canonical is count-weighted.
+    use_canonical_ema: bool = False
 
     dataset: str = "wikitext-103"
     seed: int = 42
@@ -155,6 +173,16 @@ class TPU2BConfig:
     # Cost: ~15% slower training. Worth it if it recovers PPL.
     requantize_every: int = 10
     checkpoint_every: int = 1000
+
+    # VQ-VAE commitment loss: pulls w toward nearest codebook entry.
+    # Reg is normalized by n_layers, so lam ~ 0.1-10 is a reasonable range
+    # (gradient per weight ~ 2*drift/n_layers, comparable to CE grad).
+    quant_reg_weight: float = 0.0
+    quant_reg_warmup_frac: float = 0.25
+    # Canonical VQ-VAE EMA: EMA the raw sums and counts per entry, then
+    # derive codebook as s/N. Our default is EMA-of-means which weights
+    # noisy low-count batches equally. Canonical is count-weighted.
+    use_canonical_ema: bool = False
 
     dataset: str = "wikitext-103"
     seed: int = 42

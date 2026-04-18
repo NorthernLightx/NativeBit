@@ -135,6 +135,18 @@ class NativeBitDense(nn.Module):
             lambda: jnp.zeros((out_features, in_features), dtype=jnp.bfloat16),
         )
 
+        # Canonical VQ-VAE EMA state: running sum and count per codebook entry.
+        # Used only when requantize_params(..., use_canonical_ema=True).
+        # In EMA-of-means (default), these are unused and stay at init values.
+        self.variable(
+            "cache", "ema_N",
+            lambda: jnp.ones((num_blocks, self.n_entries), dtype=jnp.float32),
+        )
+        self.variable(
+            "cache", "ema_s",
+            lambda: jnp.zeros((num_blocks, self.n_entries), dtype=jnp.float32),
+        )
+
         # STE: forward uses cached quantized weights, backward flows to latent
         # No branching — remat-safe. Cache updated externally by requantize_params().
         quantized_w = weight + jax.lax.stop_gradient(cached_delta.value)
@@ -212,8 +224,9 @@ class PackedNativeBitDense(nn.Module):
 
 
 def _extract_layer_arrays(params_inner, cache):
-    """Extract (weights, codebooks, deltas) as flat lists + metadata for jit."""
-    weights, codebooks, deltas, meta = [], [], [], []
+    """Extract (weights, codebooks, deltas, ema_N, ema_s) + metadata for jit."""
+    weights, codebooks, deltas = [], [], []
+    ema_Ns, ema_ss, meta = [], [], []
     def _walk(node, cache_node, path=()):
         if isinstance(node, dict):
             if "codebook" in node and "weight" in node:
@@ -224,17 +237,23 @@ def _extract_layer_arrays(params_inner, cache):
                 nb, ne = node["codebook"].shape
                 tw = node["weight"].size
                 bs = math.ceil(tw / nb)
+                # Canonical-EMA state (fall back to ones / codebook if missing)
+                ema_Ns.append(cache_node.get(
+                    "ema_N", jnp.ones((nb, ne), dtype=jnp.float32)))
+                ema_ss.append(cache_node.get(
+                    "ema_s", node["codebook"].astype(jnp.float32)))
                 meta.append({"path": path, "block_size": bs, "num_blocks": nb,
                              "total_weights": tw, "padded_len": nb * bs})
             else:
                 for k in node:
                     _walk(node[k], cache_node.get(k, {}), path + (k,))
     _walk(params_inner, cache)
-    return weights, codebooks, deltas, meta
+    return weights, codebooks, deltas, ema_Ns, ema_ss, meta
 
 
-def _rebuild_params(params_inner, cache, meta, new_codebooks, new_deltas):
-    """Put updated codebooks and deltas back into the params tree."""
+def _rebuild_params(params_inner, cache, meta, new_codebooks, new_deltas,
+                    new_ema_Ns=None, new_ema_ss=None):
+    """Put updated codebooks, deltas, and optional EMA state back into the tree."""
     import copy
     p = copy.copy(params_inner)
     c = copy.copy(cache)
@@ -258,17 +277,28 @@ def _rebuild_params(params_inner, cache, meta, new_codebooks, new_deltas):
             cnode[last] = {}
         cnode[last] = dict(cnode[last])
         cnode[last]["qw_delta"] = new_deltas[i]
+        if new_ema_Ns is not None:
+            cnode[last]["ema_N"] = new_ema_Ns[i]
+            cnode[last]["ema_s"] = new_ema_ss[i]
     return p, c
 
 
 # Single jitted function that processes ALL layers at once.
 # Traced once (Python logic runs during tracing), compiled, then reuses buffers.
+# Separate caches for the two EMA formulations.
 _requantize_all_jitted = None
+_requantize_all_jitted_canonical = None
 
-def _make_requantize_all(meta):
-    """Build a jitted function for this specific model structure."""
+def _make_requantize_all(meta, canonical: bool = False):
+    """Build a jitted function for this specific model structure.
+
+    canonical=False: e_new = α·e_old + (1−α)·batch_mean   (EMA of means)
+    canonical=True:  N_new = α·N_old + (1−α)·batch_count
+                     s_new = α·s_old + (1−α)·batch_sum
+                     e_new = s_new / max(N_new, eps)        (canonical VQ-VAE)
+    """
     @jax.jit
-    def _fn(weights, codebooks, ema_decay):
+    def _fn_means(weights, codebooks, ema_decay):
         new_deltas = []
         new_codebooks = []
         for i, m in enumerate(meta):
@@ -290,7 +320,6 @@ def _make_requantize_all(meta):
             quantized_flat = quantized_blocks.reshape(-1)[:tw]
             delta = (quantized_flat.reshape(w.shape) - w).astype(jnp.bfloat16)
 
-            # EMA update
             n_entries = cb.shape[1]
             one_hot = jax.nn.one_hot(indices, n_entries)
             counts = one_hot.sum(axis=1)
@@ -302,34 +331,134 @@ def _make_requantize_all(meta):
             new_deltas.append(delta)
             new_codebooks.append(new_cb)
         return new_deltas, new_codebooks
-    return _fn
+
+    @jax.jit
+    def _fn_canonical(weights, codebooks, ema_Ns, ema_ss, ema_decay):
+        new_deltas = []
+        new_codebooks = []
+        new_ema_Ns = []
+        new_ema_ss = []
+        for i, m in enumerate(meta):
+            bs = m["block_size"]
+            nb = m["num_blocks"]
+            tw = m["total_weights"]
+            pl = m["padded_len"]
+            w = weights[i]
+            cb = codebooks[i]
+            N_old = ema_Ns[i]
+            s_old = ema_ss[i]
+
+            w_flat = w.reshape(-1)
+            w_padded = jnp.pad(w_flat, (0, pl - tw))
+            w_blocks = w_padded.reshape(nb, bs)
+            block_idx = jnp.arange(nb)[:, None]
+
+            # Assignment against CURRENT codebook (cb, not the derived-from-s/N).
+            dists = jnp.square(w_blocks[:, :, None] - cb[:, None, :])
+            indices = jnp.argmin(dists, axis=-1)
+            quantized_blocks = cb[block_idx, indices]
+            quantized_flat = quantized_blocks.reshape(-1)[:tw]
+            delta = (quantized_flat.reshape(w.shape) - w).astype(jnp.bfloat16)
+
+            n_entries = cb.shape[1]
+            one_hot = jax.nn.one_hot(indices, n_entries)
+            batch_counts = one_hot.sum(axis=1)
+            batch_sums = jnp.einsum("bse,bs->be", one_hot,
+                                    w_blocks.astype(jnp.float32))
+
+            # EMA the RAW sum and count — canonical VQ-VAE (van den Oord 2017).
+            N_new = ema_decay * N_old + (1.0 - ema_decay) * batch_counts
+            s_new = ema_decay * s_old + (1.0 - ema_decay) * batch_sums
+            # Only derive codebook where we have actual statistics accumulated.
+            # Floor on N avoids division blow-up for consistently-dead entries.
+            cb_derived = s_new / jnp.maximum(N_new, 1e-5)
+            # Keep old entry when N is near-zero (dead-for-a-long-time).
+            have_stats = N_new > 1e-3
+            new_cb = jnp.where(have_stats, cb_derived, cb)
+
+            new_deltas.append(delta)
+            new_codebooks.append(new_cb)
+            new_ema_Ns.append(N_new)
+            new_ema_ss.append(s_new)
+        return new_deltas, new_codebooks, new_ema_Ns, new_ema_ss
+
+    return _fn_canonical if canonical else _fn_means
 
 
-def requantize_params(params, ema_decay=0.999):
+def requantize_params(params, ema_decay=0.999, use_canonical_ema: bool = False):
     """Recompute cached deltas and EMA-update codebooks for all NB layers.
 
     Uses a single jit-compiled function for all layers — no per-call device
-    array allocation, eliminating the TPU memory leak.
+    array allocation.
+
+    use_canonical_ema=True switches to canonical VQ-VAE EMA (EMA of raw
+    sums and counts). Requires that `cache/ema_N` and `cache/ema_s` have
+    been initialised (see `init_canonical_ema_state`).
 
     Returns (updated_params, intermediates_dict).
     """
-    global _requantize_all_jitted
+    global _requantize_all_jitted, _requantize_all_jitted_canonical
 
     params_inner = params.get("params", params)
     cache = params.get("cache", {})
-    weights, codebooks, deltas, meta = _extract_layer_arrays(params_inner, cache)
+    weights, codebooks, deltas, ema_Ns, ema_ss, meta = \
+        _extract_layer_arrays(params_inner, cache)
 
     if not weights:
         return params, {}
 
-    if _requantize_all_jitted is None:
-        _requantize_all_jitted = _make_requantize_all(meta)
+    if use_canonical_ema:
+        if _requantize_all_jitted_canonical is None:
+            _requantize_all_jitted_canonical = _make_requantize_all(
+                meta, canonical=True)
+        new_deltas, new_codebooks, new_ema_Ns, new_ema_ss = \
+            _requantize_all_jitted_canonical(
+                weights, codebooks, ema_Ns, ema_ss, jnp.float32(ema_decay))
+        new_p, new_c = _rebuild_params(
+            params_inner, cache, meta, new_codebooks, new_deltas,
+            new_ema_Ns=new_ema_Ns, new_ema_ss=new_ema_ss)
+    else:
+        if _requantize_all_jitted is None:
+            _requantize_all_jitted = _make_requantize_all(meta, canonical=False)
+        new_deltas, new_codebooks = _requantize_all_jitted(
+            weights, codebooks, jnp.float32(ema_decay))
+        new_p, new_c = _rebuild_params(
+            params_inner, cache, meta, new_codebooks, new_deltas)
 
-    new_deltas, new_codebooks = _requantize_all_jitted(
-        weights, codebooks, jnp.float32(ema_decay))
-
-    new_p, new_c = _rebuild_params(params_inner, cache, meta, new_codebooks, new_deltas)
     return {**params, "params": new_p, "cache": new_c}, {}
+
+
+def init_canonical_ema_state(params):
+    """Seed `cache/ema_s` with current codebook values and `cache/ema_N` with ones.
+
+    Call this once after codebooks have been (re-)initialised from scaled
+    weights, before enabling canonical EMA. Without this, the derived
+    codebook `s/N` starts near zero and destroys the percentile init.
+    """
+    import copy
+    params_inner = params.get("params", params)
+    cache = params.get("cache", {})
+
+    def _walk(p_node, c_node):
+        if isinstance(p_node, dict):
+            if "codebook" in p_node and "weight" in p_node:
+                if "ema_N" not in c_node:
+                    c_node["ema_N"] = jnp.ones_like(
+                        p_node["codebook"], dtype=jnp.float32)
+                else:
+                    c_node["ema_N"] = jnp.ones_like(c_node["ema_N"])
+                c_node["ema_s"] = p_node["codebook"].astype(jnp.float32)
+            else:
+                for k in p_node:
+                    if k not in c_node:
+                        c_node[k] = {}
+                    else:
+                        c_node[k] = dict(c_node[k])
+                    _walk(p_node[k], c_node[k])
+
+    new_cache = copy.deepcopy(cache)
+    _walk(params_inner, new_cache)
+    return {**params, "cache": new_cache}
 
 
 def _init_codebook_from_weight(weight, block_size, num_blocks, total_weights,
@@ -341,3 +470,58 @@ def _init_codebook_from_weight(weight, block_size, num_blocks, total_weights,
     w_blocks = w_flat.reshape(num_blocks, block_size)
     q = jnp.linspace(0, 1, n_entries)
     return jnp.quantile(w_blocks.astype(jnp.float32), q, axis=1).T
+
+
+def compute_quant_reg(params):
+    """VQ-VAE-style commitment loss for NativeBit layers.
+
+    Returns `sum_over_all_weights(min_j (w - sg(cb_j))^2) / n_nb_layers`.
+
+    Normalizing by layer count (not weight count) gives per-weight gradient
+    magnitude `2(w - Q(w)) / n_layers` — comparable to typical CE gradients
+    at realistic model scales (~1e-4 to 1e-3), so λ ~ 1 is a sensible
+    starting point rather than λ ~ 1e4 needed with per-weight mean.
+
+    Gradient flows only to w (pulls toward nearest codebook entry).
+    Codebook is stop_gradient — updated by EMA elsewhere.
+    """
+    params_inner = params.get("params", params)
+
+    total_sq = jnp.float32(0.0)
+    n_layers = 0  # static Python int — size is known at tracing time
+
+    def _walk(node):
+        nonlocal total_sq, n_layers
+        if isinstance(node, dict):
+            if "codebook" in node and "weight" in node:
+                w = node["weight"].astype(jnp.float32)
+                cb = jax.lax.stop_gradient(node["codebook"]).astype(jnp.float32)
+
+                num_blocks, n_entries = cb.shape
+                tw = w.size
+                bs = math.ceil(tw / num_blocks)
+                padded = num_blocks * bs
+
+                w_flat = w.reshape(-1)
+                if padded > tw:
+                    w_flat = jnp.pad(w_flat, (0, padded - tw))
+                w_blocks = w_flat.reshape(num_blocks, bs)
+
+                d_sq = (w_blocks[:, :, None] - cb[:, None, :]) ** 2
+                min_d_sq = d_sq.min(axis=-1)
+
+                if padded > tw:
+                    flat_idx = jnp.arange(padded)
+                    valid = (flat_idx < tw).reshape(num_blocks, bs).astype(min_d_sq.dtype)
+                    min_d_sq = min_d_sq * valid
+
+                total_sq = total_sq + min_d_sq.sum()
+                n_layers += 1
+            else:
+                for k, v in node.items():
+                    _walk(v)
+
+    _walk(params_inner)
+    if n_layers == 0:
+        return jnp.float32(0.0)
+    return total_sq / jnp.float32(n_layers)
