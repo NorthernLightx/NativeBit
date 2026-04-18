@@ -92,20 +92,18 @@ python benchmarks/benchmark_posthoc_2b.py --ckpt logs/2b_float_params.npz
 
 ```bash
 pip install -e ".[ci]"
-JAX_PLATFORMS=cpu pytest tests/ \
-    --ignore=tests/test_stale_cache.py \
-    --ignore=tests/test_train.py
+JAX_PLATFORMS=cpu pytest tests/
 ```
 
 Covers the cross-position attention regression, canonical VQ-VAE EMA,
-commitment-loss gradient, QAT init key translation (JAX), and
-NativeBitLinear/NativeBitGPT/pack/generate/data (PyTorch). CI runs
-this same invocation on every push (`.github/workflows/tests.yml`).
+commitment-loss gradient, QAT init key translation (JAX); and
+NativeBitLinear/NativeBitGPT/pack/generate/data/training-step (PyTorch).
+CI runs this same invocation on every push
+(`.github/workflows/tests.yml`).
 
-`test_stale_cache.py` is a diagnostic that loads the 13 GB 2.2B
-checkpoint, and `test_train.py` is a subprocess smoke test that
-downloads WikiText-2 on first run — both excluded from the default
-pytest command.
+Standalone diagnostic scripts that need real checkpoints or TPU hardware
+(stale-cache drift analysis, FSDP sharding, Pallas/Triton kernels) live
+in `scripts/debug/` and are run manually, not under pytest.
 
 ## Training logs
 

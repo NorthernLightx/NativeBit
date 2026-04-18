@@ -31,7 +31,4 @@ jobs:
       - name: Run tests
         env:
           JAX_PLATFORMS: cpu
-        run: |
-          pytest tests/ -v \
-            --ignore=tests/test_stale_cache.py \
-            --ignore=tests/test_train.py
+        run: pytest tests/ -v
