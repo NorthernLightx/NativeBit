@@ -1,5 +1,7 @@
 # NativeBit
 
+[![tests](https://github.com/NorthernLightx/NativeBit/actions/workflows/tests.yml/badge.svg)](https://github.com/NorthernLightx/NativeBit/actions/workflows/tests.yml)
+
 Quantization-aware training for LLMs with per-block learned codebooks. At 2.2B parameters and 3-bit precision, a fine-tuned NativeBit model matches its float counterpart on WikiText-103 (30.50 vs 30.51 perplexity) while beating post-hoc RTN quantization by 2.7%.
 
 ## Result
