@@ -13,7 +13,8 @@ def generate(
     top_k: int = 40,
     device: torch.device = None,
     stop_at_eos: bool = True,
-) -> str:
+    return_ids: bool = False,
+):
     """Generate text from a prompt using greedy/sampling decoding.
 
     Args:
@@ -25,7 +26,10 @@ def generate(
         device: Device to run on.
 
     Returns:
-        Generated text (prompt + completion).
+        Generated text (prompt + completion). If return_ids=True, returns
+        (text, new_token_ids) where new_token_ids are the generated tokens
+        excluding the prompt — use this to count generation exactly, since a
+        BPE decode/re-encode roundtrip is not a bijection.
     """
     if device is None:
         device = next(model.parameters()).device
@@ -63,7 +67,10 @@ def generate(
 
     output_ids = idx[0].tolist()
     model.train()
-    return enc.decode(output_ids)
+    text = enc.decode(output_ids)
+    if return_ids:
+        return text, output_ids[len(input_ids):]
+    return text
 
 
 def load_model_from_checkpoint(ckpt_path: str, device: torch.device):

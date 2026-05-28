@@ -34,33 +34,24 @@ class TestGenerate:
         assert text.startswith("Hello")
 
     def test_max_tokens_respected(self, tiny_model):
-        import tiktoken
-        enc = tiktoken.get_encoding("gpt2")
-
-        # Use greedy (temperature=0) to avoid BPE roundtrip issues
-        # and count via the raw token IDs inside generate
+        # Count generated tokens exactly via the returned IDs. A BPE
+        # decode/re-encode roundtrip is not a bijection (adjacent generated
+        # tokens can merge), so counting re-encoded text under-counts and is
+        # tiktoken-version-dependent. return_ids gives the exact generated count.
         for max_t in [5, 20, 50]:
-            text = generate(tiny_model, "The", max_tokens=max_t,
-                            temperature=0, stop_at_eos=False)
-            tokens = enc.encode(text, allowed_special={"<|endoftext|>"})
-            prompt_tokens = len(enc.encode("The", allowed_special={"<|endoftext|>"}))
-            gen_tokens = len(tokens) - prompt_tokens
-            # BPE decode/re-encode can differ by +/- 1 token
-            assert abs(gen_tokens - max_t) <= 1, f"Expected ~{max_t}, got {gen_tokens}"
+            text, new_ids = generate(tiny_model, "The", max_tokens=max_t,
+                                     temperature=0, stop_at_eos=False,
+                                     return_ids=True)
+            assert len(new_ids) == max_t, f"Expected {max_t}, got {len(new_ids)}"
 
     def test_stop_at_eos_false(self, tiny_model):
-        # With stop_at_eos=False, generate should run the full loop (max_tokens
-        # new tokens) without early-stopping on EOS.
-        #
-        # We can't check the count exactly via BPE round-trip: decoded text
-        # re-encoded with tiktoken can differ substantially from the generated
-        # token count, especially for a random-init tiny model whose output
-        # contains byte sequences that re-tokenize differently. Just verify
-        # the output is non-trivial length — the real "didn't stop early"
-        # guarantee lives in the `for _ in range(max_tokens)` loop.
-        text = generate(tiny_model, "The", max_tokens=30,
-                        temperature=0, stop_at_eos=False)
-        assert len(text) > len("The"), "generate produced no new content"
+        # With stop_at_eos=False, generate runs the full loop and emits exactly
+        # max_tokens new tokens. Check the generated IDs directly rather than a
+        # BPE round-trip (see test_max_tokens_respected).
+        text, new_ids = generate(tiny_model, "The", max_tokens=30,
+                                 temperature=0, stop_at_eos=False,
+                                 return_ids=True)
+        assert len(new_ids) == 30, f"Expected 30 new tokens, got {len(new_ids)}"
 
     def test_greedy_deterministic(self, tiny_model):
         t1 = generate(tiny_model, "Once", max_tokens=20, temperature=0)
