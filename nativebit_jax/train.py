@@ -833,12 +833,35 @@ def train(config, use_nativebit: bool = True, use_aqt: bool = False,
     print(f"  Test loss: {test_loss:.4f}  Test PPL: {test_ppl:.2f}")
     print(f"  Total time: {elapsed_total:.0f}s")
 
+    # Cross-eval on WikiText-103 (the dataset results are reported on). Skip
+    # when we trained on it, since then the in-domain test set already IS WT-103.
+    wt103_loss = wt103_ppl = None
+    if dataset != "wikitext-103":
+        try:
+            _, _, wt103_test = load_tokens("wikitext-103", data_dir)
+            wt_total, wt_nb = 0.0, 0
+            for x_b, y_b in make_batches(wt103_test, config.context_len,
+                                         config.batch_size, jax.random.PRNGKey(0)):
+                x_b, y_b = _to_device(x_b, y_b)
+                wt_total += float(eval_step_fn(state.params, x_b, y_b))
+                wt_nb += 1
+            wt103_loss = wt_total / max(wt_nb, 1)
+            wt103_ppl = math.exp(min(wt103_loss, 20))
+            print(f"  WikiText-103 cross-eval loss: {wt103_loss:.4f}  PPL: {wt103_ppl:.2f}")
+        except Exception as e:
+            print(f"  WikiText-103 cross-eval skipped: {e}")
+
     # Write eval results to JSONL (so they survive even if stdout is lost)
+    eval_record = {
+        "type": "eval", "dataset": dataset,
+        "test_loss": round(test_loss, 6), "test_ppl": round(test_ppl, 2),
+        "total_time_s": round(elapsed_total, 0),
+    }
+    if wt103_ppl is not None:
+        eval_record["wt103_test_loss"] = round(wt103_loss, 6)
+        eval_record["wt103_test_ppl"] = round(wt103_ppl, 2)
     with open(jsonl_path, "a") as f:
-        f.write(json.dumps({
-            "type": "eval", "test_loss": round(test_loss, 6),
-            "test_ppl": round(test_ppl, 2), "total_time_s": round(elapsed_total, 0),
-        }) + "\n")
+        f.write(json.dumps(eval_record) + "\n")
 
     # Save final checkpoint
     import numpy as np
@@ -910,6 +933,14 @@ def main():
                         help="Override codebook EMA decay (default 0.999). "
                              "Lower values = faster adapt, useful for short "
                              "QAT runs.")
+    parser.add_argument("--dataset", type=str, default=None,
+                        help="Override training dataset (e.g. openwebtext, "
+                             "wikitext-103, wikitext-2). Final eval also "
+                             "cross-evaluates on WikiText-103 unless trained on it.")
+    parser.add_argument("--lr", type=float, default=None,
+                        help="Override peak learning rate (config.lr).")
+    parser.add_argument("--weight-decay", type=float, default=None,
+                        help="Override AdamW weight decay (config.weight_decay).")
     args = parser.parse_args()
 
     from configs.default import DefaultConfig
@@ -943,6 +974,12 @@ def main():
         config.delay_quant_steps = args.delay_quant_steps
     if args.ema_decay is not None:
         config.ema_decay = args.ema_decay
+    if args.dataset is not None:
+        config.dataset = args.dataset
+    if args.lr is not None:
+        config.lr = args.lr
+    if args.weight_decay is not None:
+        config.weight_decay = args.weight_decay
     config.seed = args.seed
 
     use_nativebit = not args.no_nativebit
