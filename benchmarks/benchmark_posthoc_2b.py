@@ -150,6 +150,11 @@ def main():
                         help="NativeBit co-trained PPL to compare against "
                              "(read from the NB eval log 'type=eval' record). "
                              "Omit to skip NB comparison.")
+    parser.add_argument("--methods", type=str, default=None,
+                        help="Comma-separated subset of post-hoc methods to run "
+                             "(keys: rtn128, rtn64, km8, km6, km4). Default: all. "
+                             "Run one at a time on memory-constrained hosts — the "
+                             "float params are freed before the final method's eval.")
     args = parser.parse_args()
 
     config = TPU2BConfig()
@@ -184,18 +189,40 @@ def main():
     float_ppl, n_batches = eval_ppl(eval_fn, float_params, test_tokens, config, mesh)
     print(f"  Float baseline PPL: {float_ppl:.2f} ({n_batches} batches, {time.time()-t0:.0f}s)")
 
-    results = [{"method": "Float (baseline)", "ppl": float_ppl}]
+    results = [{"method": "Float (baseline)", "ppl": round(float_ppl, 2)}]
 
-    # Post-hoc methods
-    methods = [
-        ("RTN 3-bit bs=128",               "uniform", 8,  128),
-        ("RTN 3-bit bs=64",                "uniform", 8,  64),
-        ("K-means 8-entry (3-bit) bs=128", "kmeans",  8,  128),
-        ("K-means 6-entry (~2.6b) bs=128", "kmeans",  6,  128),
-        ("K-means 4-entry (2-bit) bs=128", "kmeans",  4,  128),
+    # Post-hoc methods: (key, label, method, n_entries, block_size)
+    all_methods = [
+        ("rtn128", "RTN 3-bit bs=128",               "uniform", 8,  128),
+        ("rtn64",  "RTN 3-bit bs=64",                "uniform", 8,  64),
+        ("km8",    "K-means 8-entry (3-bit) bs=128", "kmeans",  8,  128),
+        ("km6",    "K-means 6-entry (~2.6b) bs=128", "kmeans",  6,  128),
+        ("km4",    "K-means 4-entry (2-bit) bs=128", "kmeans",  4,  128),
     ]
+    if args.methods:
+        wanted = {m.strip() for m in args.methods.split(",")}
+        methods = [m for m in all_methods if m[0] in wanted]
+        if not methods:
+            print(f"  No methods matched --methods={args.methods}. "
+                  f"Valid keys: {', '.join(m[0] for m in all_methods)}")
+            sys.exit(1)
+    else:
+        methods = all_methods
 
-    for name, method, n_entries, bs in methods:
+    out_path = os.path.join(args.log_dir, f"posthoc_2b_s{args.seed}.json")
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+    def save_results():
+        with open(out_path, "w") as f:
+            json.dump({
+                "seed": args.seed, "ckpt": ckpt_path,
+                "float_ppl": round(float_ppl, 2),
+                "nb_ppl": args.nb_ppl, "results": results,
+            }, f, indent=2)
+
+    save_results()  # persist the baseline before any memory-heavy method runs
+
+    for i, (key, name, method, n_entries, bs) in enumerate(methods):
         print(f"\n  {name}...", flush=True)
         t0 = time.time()
         q_params = quantize_params(float_params, method, n_entries, bs)
@@ -208,6 +235,14 @@ def main():
                 return new
             q_params = jax.tree.map(_reshard, float_params, q_params)
 
+        # Free the float params before the final method's eval. Quantization is
+        # done with them, and holding float + quantized + eval activations live at
+        # once is what OOMs a memory-constrained host. Run one method at a time
+        # (e.g. --methods rtn128) so this headroom applies to that method.
+        if i == len(methods) - 1:
+            del float_params
+            gc.collect()
+
         ppl, _ = eval_ppl(eval_fn, q_params, test_tokens, config, mesh)
         dt = time.time() - t0
         delta = (ppl / float_ppl - 1) * 100
@@ -215,6 +250,7 @@ def main():
         print(f"    PPL: {ppl:.2f} ({sign}{delta:.1f}%) [{dt:.0f}s]")
         results.append({"method": name, "ppl": round(ppl, 2),
                         "delta_pct": round(delta, 2)})
+        save_results()  # persist after each method so a later OOM keeps progress
         del q_params; gc.collect()
 
     # Final table
@@ -240,16 +276,9 @@ def main():
         print(f"  NativeBit comparison skipped — pass --nb-ppl to include.")
     print(f"  {'='*54}")
 
-    # Save
-    out_path = os.path.join(args.log_dir, f"posthoc_2b_s{args.seed}.json")
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    with open(out_path, "w") as f:
-        json.dump({
-            "seed": args.seed,
-            "float_ppl": round(float_ppl, 2),
-            "nb_ppl": args.nb_ppl,
-            "results": results,
-        }, f, indent=2)
+    # Results were already persisted incrementally (after the baseline and each
+    # method); this final write just captures the complete set in one place.
+    save_results()
     print(f"\n  Saved: {out_path}")
 
 
