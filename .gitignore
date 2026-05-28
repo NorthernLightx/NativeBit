@@ -88,3 +88,7 @@ run_doe_125m.py
 run_350m_float_bs8.py
 *.nbpack.npz
 CLAUDE.md
+
+# 2.2B autoresearch scaffolding — TPU-only, kept local (no TPU quota)
+autoresearch/autoresearch_2b.py
+autoresearch/evaluator_2b.py
