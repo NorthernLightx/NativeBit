@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .codebook_utils import init_codebook_percentile
+from .codebook_utils import init_codebook_percentile_batch
 
 
 # ---------------------------------------------------------------------------
@@ -93,11 +93,12 @@ def quantize_kmeans(model: nn.Module, n_entries: int = 8,
         w_padded = F.pad(w, (0, padded - n)) if padded > n else w
         w_blocks = w_padded.view(num_blocks, block_size)
 
-        for b in range(num_blocks):
-            cb = init_codebook_percentile(w_blocks[b], n_entries)
-            dists = (w_blocks[b].unsqueeze(-1) - cb.unsqueeze(0)).abs()
-            indices = dists.argmin(dim=-1)
-            w_blocks[b] = cb[indices]
+        # Vectorized across blocks — the per-block Python loop took tens of
+        # minutes at 48M+ scale
+        cb = init_codebook_percentile_batch(w_blocks, n_entries)  # (B, E)
+        dists = (w_blocks.unsqueeze(-1) - cb.unsqueeze(1)).abs()
+        indices = dists.argmin(dim=-1)
+        w_blocks = cb.gather(1, indices.view(num_blocks, -1)).view_as(w_blocks)
 
         module.weight.data = w_blocks.view(-1)[:n].view_as(module.weight.data)
         # Size: bits per weight + codebook entries * 16 bits per block
