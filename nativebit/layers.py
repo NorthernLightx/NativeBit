@@ -10,7 +10,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .codebook_utils import init_codebook_percentile, revive_dead_entries
+from .codebook_utils import (
+    init_codebook_percentile, revive_dead_entries, ema_update_canonical,
+)
 
 
 class NativeBitLinear(nn.Module):
@@ -60,6 +62,16 @@ class NativeBitLinear(nn.Module):
             persistent=False,
         )
 
+        # Canonical VQ-VAE EMA state: running count and sum per codebook entry.
+        # Persistent so QAT runs can resume with statistics intact. Seeded so
+        # that s/N equals the initial codebook (see init_canonical_ema_state).
+        self.register_buffer(
+            "ema_N", torch.ones(self.num_blocks, n_entries, dtype=torch.float32)
+        )
+        self.register_buffer(
+            "ema_s", torch.zeros(self.num_blocks, n_entries, dtype=torch.float32)
+        )
+
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
@@ -74,6 +86,7 @@ class NativeBitLinear(nn.Module):
             start = b * self.block_size
             end = min(start + self.block_size, self.total_weights)
             self.codebook.data[b] = init_codebook_percentile(w_flat[start:end], self.n_entries)
+        self.init_canonical_ema_state()
 
     def _quantize(self, w_flat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Quantize weights to nearest codebook entries.
@@ -106,6 +119,51 @@ class NativeBitLinear(nn.Module):
 
         return F.linear(x, quantized_w, self.bias)
 
+    def _weight_blocks(self) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Return (weight_blocks, valid_mask). valid_mask is None if no padding."""
+        w_flat = self.weight.view(-1)
+        if self._padded_len > self.total_weights:
+            w_padded = F.pad(w_flat, (0, self._padded_len - self.total_weights))
+            valid = torch.zeros(self._padded_len, dtype=torch.bool,
+                                device=w_flat.device)
+            valid[:self.total_weights] = True
+            return (w_padded.view(self.num_blocks, self.block_size),
+                    valid.view(self.num_blocks, self.block_size))
+        return w_flat.view(self.num_blocks, self.block_size), None
+
+    def init_canonical_ema_state(self) -> None:
+        """Seed ema_s with current codebook and ema_N with ones, so s/N = codebook.
+
+        Call after any external codebook re-init (e.g. QAT percentile re-init
+        from trained float weights). Without this, the first derived codebook
+        would jump away from the fitted init.
+        """
+        with torch.no_grad():
+            self.ema_N.fill_(1.0)
+            self.ema_s.copy_(self.codebook.data.float())
+
+    @torch.no_grad()
+    def ema_update(self, decay: float = 0.99) -> None:
+        """Canonical VQ-VAE EMA codebook update from current weight assignments."""
+        w_blocks, valid_mask = self._weight_blocks()
+        ema_update_canonical(self.codebook, self.ema_N, self.ema_s,
+                             w_blocks, decay, valid_mask)
+
+    def commitment_loss(self) -> torch.Tensor:
+        """VQ-VAE commitment: sum of min_j (w - sg(cb_j))^2 over this layer.
+
+        Gradient flows only to the latent weights (pulls them toward the
+        nearest codebook entry); the codebook is detached — it is updated
+        by EMA, not by this loss.
+        """
+        w_blocks, valid_mask = self._weight_blocks()
+        cb = self.codebook.detach().float()
+        dists = (w_blocks.float().unsqueeze(-1) - cb.unsqueeze(1)).square()
+        min_d = dists.min(dim=-1).values
+        if valid_mask is not None:
+            min_d = min_d * valid_mask.float()
+        return min_d.sum()
+
     def update_utilization_from_cache(self) -> None:
         """Update utilization counters from the last forward pass."""
         if hasattr(self, '_last_indices'):
@@ -137,3 +195,16 @@ class NativeBitLinear(nn.Module):
         return (f"in_features={self.in_features}, out_features={self.out_features}, "
                 f"bias={self.bias is not None}, block_size={self.block_size}, "
                 f"n_entries={self.n_entries}, num_blocks={self.num_blocks}")
+
+
+def compute_quant_reg(nb_layers: list["NativeBitLinear"]) -> torch.Tensor:
+    """VQ-VAE commitment loss summed over layers, normalized by layer count.
+
+    Mirrors the JAX `compute_quant_reg`: normalizing by layer count (not
+    weight count) gives per-weight gradient magnitude 2(w - Q(w))/n_layers,
+    comparable to typical CE gradients — so λ ~ 1 is a sensible scale.
+    """
+    if not nb_layers:
+        return torch.tensor(0.0)
+    total = sum(layer.commitment_loss() for layer in nb_layers)
+    return total / len(nb_layers)

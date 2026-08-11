@@ -34,7 +34,7 @@ import torch.nn.functional as F
 
 from nativebit.seed import set_seed
 from nativebit.model import build_model_from_config
-from nativebit.layers import NativeBitLinear
+from nativebit.layers import NativeBitLinear, compute_quant_reg
 from nativebit.data import get_dataloaders, compute_bpb
 from nativebit.logging import TrainingLogger, compute_gradient_info
 from nativebit.device import (
@@ -274,6 +274,25 @@ def train(model: nn.Module, config, device: torch.device,
     model = model.to(device)
     model.train()
 
+    # QAT / EMA knobs (mirror nativebit_jax/train.py; getattr so plain
+    # configs keep working)
+    use_canonical_ema = use_nativebit and getattr(config, "use_canonical_ema", False)
+    ema_decay = getattr(config, "ema_decay", 0.99)
+    requantize_every = getattr(config, "requantize_every", 10)
+    quant_reg_weight = getattr(config, "quant_reg_weight", 0.0) if use_nativebit else 0.0
+    quant_reg_warmup_frac = getattr(config, "quant_reg_warmup_frac", 0.25)
+    revive_every = getattr(config, "revive_every", 100)
+    grad_accum = max(1, getattr(config, "grad_accum", 1))
+    if grad_accum > 1:
+        print(f"  Grad accumulation: {grad_accum} micro-batches/step "
+              f"({config.batch_size * config.context_len * grad_accum} tok/step)")
+    if use_canonical_ema:
+        print(f"  Canonical EMA codebooks: decay={ema_decay}, "
+              f"update every {requantize_every} steps (revival disabled)")
+    if quant_reg_weight > 0.0:
+        print(f"  Commitment loss: lambda={quant_reg_weight}, "
+              f"warmup_frac={quant_reg_warmup_frac}")
+
     # Data
     train_loader, valid_loader, test_loader = get_dataloaders(
         config.context_len, config.batch_size, data_dir,
@@ -305,6 +324,15 @@ def train(model: nn.Module, config, device: torch.device,
     use_scaler = needs_grad_scaler(device)
     scaler = torch.amp.GradScaler("cuda", enabled=use_scaler) if use_scaler else None
 
+    # QAT: eval BEFORE preflight mutates the model. For an NB model at
+    # loaded float weights this is the "post-hoc percentile-quantized"
+    # baseline the fine-tune must beat.
+    _is_qat = getattr(config, "eval_at_start", False)
+    if _is_qat:
+        init_val = run_evaluation(model, valid_loader, device)
+        print(f"  Initial val loss={init_val:.4f} "
+              f"ppl={math.exp(min(init_val, 20)):.2f} (pre-QAT, quantized)")
+
     # --- Preflight: validate config + throughput before committing ---
     preflight_sps, preflight_loss = run_preflight(
         model, config, device, train_loader, optimizer, scheduler, scaler,
@@ -313,6 +341,8 @@ def train(model: nn.Module, config, device: torch.device,
 
     # Training loop (continues from where preflight left off)
     step = 0
+    nb_layers = (model.get_nativebit_layers()
+                 if use_nativebit and hasattr(model, "get_nativebit_layers") else [])
     train_iter = iter(train_loader)
     # Track for early gates
     _gate_initial_loss = preflight_loss
@@ -320,30 +350,70 @@ def train(model: nn.Module, config, device: torch.device,
     _gate_checked_200 = False
     _gate_checked_500 = False
 
+    # Crash-safe periodic checkpoint (single rolling file, atomic replace)
+    ckpt_every = getattr(config, "ckpt_every", 1000)
+    resume_path = os.path.join(log_dir, f"{experiment_name}_resume.pt")
+    if getattr(config, "resume", False) and os.path.exists(resume_path):
+        rck = torch.load(resume_path, map_location=device, weights_only=True)
+        model.load_state_dict(rck["model_state_dict"])
+        optimizer.load_state_dict(rck["optimizer_state_dict"])
+        scheduler.load_state_dict(rck["scheduler_state_dict"])
+        if scaler is not None and rck.get("scaler_state_dict"):
+            scaler.load_state_dict(rck["scaler_state_dict"])
+        step = rck["step"] + 1
+        print(f"  Resumed from {resume_path} at step {step}")
+
+    def _save_resume_ckpt(cur_step: int) -> None:
+        tmp = resume_path + ".tmp"
+        torch.save({
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
+            "scaler_state_dict": scaler.state_dict() if scaler is not None else None,
+            "step": cur_step,
+        }, tmp)
+        os.replace(tmp, resume_path)
+
     while True:
         optimizer.zero_grad()
 
-        # Get batch
-        try:
-            x, y = next(train_iter)
-        except StopIteration:
-            train_iter = iter(train_loader)
-            x, y = next(train_iter)
-        x, y = x.to(device), y.to(device)
+        # Micro-batch loop: grad_accum forwards per optimizer step. With
+        # batch_size 8 and grad_accum 8 a local run sees the same tokens
+        # per optimizer step as the TPU configs (batch 64), so lr/warmup/
+        # max_steps transfer verbatim.
+        loss_val = torch.tensor(0.0, device=device)
+        for _ in range(grad_accum):
+            try:
+                x, y = next(train_iter)
+            except StopIteration:
+                train_iter = iter(train_loader)
+                x, y = next(train_iter)
+            x, y = x.to(device), y.to(device)
 
-        # Forward + loss
-        with amp_context(device):
-            logits = model(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
+            with amp_context(device):
+                logits = model(x)
+                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
 
-        # Backward
-        if scaler is not None:
-            scaler.scale(loss).backward()
-        else:
-            loss.backward()
+            micro_loss = loss / grad_accum
+            if scaler is not None:
+                scaler.scale(micro_loss).backward()
+            else:
+                micro_loss.backward()
+            # Defer .item() — accumulate loss on device, sync only at log steps
+            loss_val = loss_val + loss.detach() / grad_accum
 
-        # Defer .item() — accumulate loss on device, sync only at log steps
-        loss_val = loss.detach()
+        # Commitment loss (fp32, outside autocast), once per optimizer step —
+        # weights don't move between micro-batches. Linear warmup on lambda
+        # over quant_reg_warmup_frac of training, matching the JAX backend.
+        if quant_reg_weight > 0.0:
+            warm = max(int(config.max_steps * quant_reg_warmup_frac), 1)
+            lam = quant_reg_weight * min(1.0, step / warm)
+            if lam > 0.0:
+                reg = lam * compute_quant_reg(nb_layers)
+                if scaler is not None:
+                    scaler.scale(reg).backward()
+                else:
+                    reg.backward()
 
         # Gradient clipping + optimizer step
         if scaler is not None:
@@ -364,15 +434,24 @@ def train(model: nn.Module, config, device: torch.device,
         scheduler.step()
         mark_step()  # XLA: trigger execution; no-op on CUDA/CPU
 
+        # Canonical EMA codebook update (QAT recipe). Assignments recomputed
+        # from post-step weights; codebook derived as s/N in place.
+        if use_canonical_ema and step > 0 and step % requantize_every == 0:
+            for layer in nb_layers:
+                layer.ema_update(ema_decay)
+
         # Update utilization counters
         if (step % config.log_every == 0 or
-                (step > 0 and step % config.revive_every == 0)):
+                (step > 0 and step % revive_every == 0)):
             if hasattr(model, "update_all_utilization"):
                 model.update_all_utilization()
 
-        # Revive dead codebook entries
-        if (hasattr(model, "revive_all_dead_entries") and
-                step > 0 and step % config.revive_every == 0):
+        # Revive dead codebook entries. Disabled under canonical EMA: the
+        # s/N derivation holds dead entries at their old value, and split
+        # revival would desync codebook from the ema_s/ema_N statistics.
+        if (not use_canonical_ema and
+                hasattr(model, "revive_all_dead_entries") and
+                step > 0 and step % revive_every == 0):
             revived = model.revive_all_dead_entries()
             if revived > 0:
                 print(f"  Step {step}: revived {revived} dead codebook entries")
@@ -409,7 +488,9 @@ def train(model: nn.Module, config, device: torch.device,
                         f"Try: lower codebook_lr, smaller block_size, or fewer n_codebook entries."
                     )
                 # Check loss decreased from init
-                if _gate_initial_loss > 0 and loss_scalar > _gate_initial_loss * 0.95:
+                # QAT starts near-converged — loss-drop gates only apply from scratch
+                if (not _is_qat and _gate_initial_loss > 0
+                        and loss_scalar > _gate_initial_loss * 0.95):
                     _abort(
                         f"Loss barely decreased by step 200: "
                         f"{_gate_initial_loss:.3f} -> {loss_scalar:.3f}. "
@@ -426,12 +507,16 @@ def train(model: nn.Module, config, device: torch.device,
                         f"This run will not converge well."
                     )
                 # Loss should have dropped significantly by now
-                if _gate_initial_loss > 0 and loss_scalar > _gate_initial_loss * 0.80:
+                if (not _is_qat and _gate_initial_loss > 0
+                        and loss_scalar > _gate_initial_loss * 0.80):
                     _abort(
                         f"Loss only dropped {(1 - loss_scalar/_gate_initial_loss)*100:.0f}% by step 500 "
                         f"({_gate_initial_loss:.3f} -> {loss_scalar:.3f}). "
                         f"Expected at least 20% reduction. Check config."
                     )
+
+        if step > 0 and step % ckpt_every == 0:
+            _save_resume_ckpt(step)
 
         if step >= config.max_steps:
             break
@@ -472,6 +557,8 @@ def train(model: nn.Module, config, device: torch.device,
         "test_loss": test_loss, "test_ppl": test_ppl, "val_bpb": val_bpb,
     }, ckpt_path)
     print(f"  Checkpoint: {ckpt_path}")
+    if os.path.exists(resume_path):
+        os.remove(resume_path)  # final ckpt saved; rolling ckpt now redundant
     logger.close()
 
     train_loss = loss_val.item() if torch.is_tensor(loss_val) else loss_val
@@ -489,13 +576,49 @@ def main():
     parser.add_argument("--log-dir", type=str, default="logs")
     parser.add_argument("--data-dir", type=str, default="data")
     parser.add_argument("--config", type=str, default="default",
-                        choices=["default", "tpu-small", "tpu-medium", "tpu-large", "tpu-xl"],
-                        help="Config preset (default for RTX 3070, tpu-* for Cloud TPU)")
+                        choices=["default", "local-76m", "tpu-small", "tpu-medium",
+                                 "tpu-large", "tpu-xl"],
+                        help="Config preset (default/local-* for RTX 3070, "
+                             "tpu-* for Cloud TPU)")
+    # Overrides
+    parser.add_argument("--lr", type=float, default=None,
+                        help="Override peak learning rate")
+    parser.add_argument("--batch-size", type=int, default=None,
+                        help="Override batch size (e.g. fit TPU configs on 8GB GPU)")
+    parser.add_argument("--dataset", type=str, default=None,
+                        choices=["wikitext-2", "wikitext-103", "tinystories"],
+                        help="Override dataset")
+    # QAT (recipe from the JAX backend: load float ckpt, fine-tune with
+    # commitment loss + canonical EMA codebooks)
+    parser.add_argument("--init-from", type=str, default=None,
+                        help="Checkpoint (.pt) to initialize weights from, "
+                             "e.g. a trained float baseline for QAT")
+    parser.add_argument("--quant-reg-weight", type=float, default=None,
+                        help="Commitment loss weight lambda (QAT recipe: 1.0)")
+    parser.add_argument("--canonical-ema", action="store_true",
+                        help="Canonical VQ-VAE EMA codebook updates (QAT recipe)")
+    parser.add_argument("--ema-decay", type=float, default=None,
+                        help="EMA decay alpha (QAT recipe: 0.99)")
+    parser.add_argument("--requantize-every", type=int, default=None,
+                        help="Steps between EMA codebook updates (default 10)")
+    parser.add_argument("--grad-accum", type=int, default=None,
+                        help="Micro-batches per optimizer step (default 1). "
+                             "batch_size 8 x accum 8 matches the TPU configs' "
+                             "tokens/step, so their lr/warmup transfer as-is")
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume from {log_dir}/{name}_resume.pt if present. "
+                             "Restores model/optimizer/scheduler/step; data "
+                             "order and RNG restart")
+    parser.add_argument("--ckpt-every", type=int, default=None,
+                        help="Steps between rolling resume checkpoints (default 1000)")
     args = parser.parse_args()
 
     config_map = {
         "default": DefaultConfig,
     }
+    if args.config == "local-76m":
+        from configs.local import Local76MConfig
+        config_map["local-76m"] = Local76MConfig
     # Lazy import TPU configs — avoids import on machines without them
     if args.config.startswith("tpu"):
         from configs.tpu import TPUSmallConfig, TPUMediumConfig, TPULargeConfig, TPUXLConfig
@@ -509,6 +632,26 @@ def main():
     config = config_map[args.config]()
     if args.max_steps is not None:
         config.max_steps = args.max_steps
+    if args.lr is not None:
+        config.lr = args.lr
+    if args.batch_size is not None:
+        config.batch_size = args.batch_size
+    if args.dataset is not None:
+        config.dataset = args.dataset
+    if args.quant_reg_weight is not None:
+        config.quant_reg_weight = args.quant_reg_weight
+    if args.canonical_ema:
+        config.use_canonical_ema = True
+    if args.ema_decay is not None:
+        config.ema_decay = args.ema_decay
+    if args.requantize_every is not None:
+        config.requantize_every = args.requantize_every
+    if args.grad_accum is not None:
+        config.grad_accum = args.grad_accum
+    if args.resume:
+        config.resume = True
+    if args.ckpt_every is not None:
+        config.ckpt_every = args.ckpt_every
     config.seed = args.seed
     set_seed(config.seed)
 
@@ -518,7 +661,8 @@ def main():
     model = build_model_from_config(config, use_nativebit=use_nativebit)
 
     # Re-init codebooks via k-means after model._init_weights rescales some layers
-    if use_nativebit and hasattr(model, 'get_nativebit_layers'):
+    # (from-scratch path; QAT re-inits from loaded weights below instead)
+    if use_nativebit and args.init_from is None and hasattr(model, 'get_nativebit_layers'):
         from nativebit.codebook_utils import init_codebook_kmeans_batch
         for layer in model.get_nativebit_layers():
             w_flat = layer.weight.data.view(-1)
@@ -526,6 +670,40 @@ def main():
                 w_flat = F.pad(w_flat, (0, layer._padded_len - layer.total_weights))
             w_blocks = w_flat.view(layer.num_blocks, layer.block_size)
             layer.codebook.data.copy_(init_codebook_kmeans_batch(w_blocks, layer.n_entries))
+            layer.init_canonical_ema_state()
+
+    # QAT: load weights from a trained checkpoint, then fit codebooks to the
+    # loaded distribution (percentile per block, matching the JAX backend).
+    if args.init_from is not None:
+        print(f"  QAT init: loading weights from {args.init_from}")
+        ckpt = torch.load(args.init_from, map_location="cpu", weights_only=True)
+        sd = ckpt.get("model_state_dict", ckpt)
+        # Checkpoints saved from a torch.compile'd model carry an _orig_mod. prefix
+        sd = {k.removeprefix("_orig_mod."): v for k, v in sd.items()}
+        missing, unexpected = model.load_state_dict(sd, strict=False)
+        # Missing keys must all be NB-specific state absent from float ckpts
+        nb_only = ("codebook", "utilization", "ema_N", "ema_s")
+        bad_missing = [k for k in missing if not any(t in k for t in nb_only)]
+        if bad_missing:
+            raise RuntimeError(
+                f"QAT init: {len(bad_missing)} model params not found in "
+                f"checkpoint, e.g. {bad_missing[:3]}. Architecture mismatch?")
+        if unexpected:
+            print(f"  QAT init: ignoring {len(unexpected)} unexpected ckpt keys "
+                  f"(e.g. {unexpected[:2]})")
+        print(f"  QAT init: loaded {len(sd) - len(unexpected)} tensors")
+
+        if use_nativebit:
+            from nativebit.codebook_utils import init_codebook_percentile_batch
+            for layer in model.get_nativebit_layers():
+                w_flat = layer.weight.data.view(-1)
+                if layer._padded_len > layer.total_weights:
+                    w_flat = F.pad(w_flat, (0, layer._padded_len - layer.total_weights))
+                w_blocks = w_flat.view(layer.num_blocks, layer.block_size)
+                layer.codebook.data.copy_(
+                    init_codebook_percentile_batch(w_blocks, layer.n_entries))
+                layer.init_canonical_ema_state()
+        config.eval_at_start = True
 
     # torch.compile on CUDA only — XLA compiles automatically
     if is_cuda(device):
