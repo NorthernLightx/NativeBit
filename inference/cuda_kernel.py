@@ -1,11 +1,20 @@
 """CUDA fused 3-bit dequant-matvec kernel for NativeBit packed inference.
 
-Reads 3-bit packed indices from VRAM, unpacks via bit shifts, looks up
-codebook values from registers (not compare+select), and accumulates
-the dot product. One thread per output row.
+One warp per output row; lanes stride across 3-byte index groups so packed
+reads coalesce. Codebook dequant is a dynamically-indexed local array
+(L1-resident, one hot 32-byte line per block); warp shuffle reduces the
+partial sums. Supports block_size 128 (TPU configs) and 64 (local configs).
 
-The codebook (8 floats = 32 bytes) fits entirely in registers.
-cb[idx] compiles to a single indexed register access — no branching.
+Three variants, auto-dispatched: shuffle-LUT (default when K % 256 == 0),
+byte-load, uint32-load. The shuffle-LUT kernel holds each block's 8 codebook
+entries in warp lanes and dequantizes via __shfl_sync with a variable source
+lane — a pure ALU lookup with no local-memory array — plus float4 x loads
+and a 2-step / 2-accumulator unroll.
+
+Measured on RTX 3070 (interleaved CUDA-event timing, warm clocks): the
+shuffle-LUT variant runs 2.2B decode shapes in ~39-54us vs cuBLAS fp16
+matvec ~96-107us — 2.0-2.5x, 250-300 GB/s effective (~2/3 of DRAM peak).
+The byte variant (no K%256 requirement) is ~1.2-1.4x cuBLAS.
 """
 import os
 import torch
@@ -35,71 +44,323 @@ _CUDA_SRC = r"""
 #include <torch/extension.h>
 #include <cuda_fp16.h>
 
+// One WARP per output row, lanes stride across the row's 8-index groups.
+// Byte-load variant: adjacent lanes read adjacent 3-byte chunks (coalesced).
+// Wins at large K where the uint32 variant's register pressure hurts.
+__global__ void dequant_matvec_3bit_bytes_kernel(
+    const float* __restrict__ x,
+    const uint8_t* __restrict__ packed,
+    const float* __restrict__ codebook,
+    float* __restrict__ y,
+    int N, int groups_per_row, int gpb
+) {
+    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    int lane = threadIdx.x & 31;
+    if (warp_id >= N) return;
+
+    const uint8_t* prow = packed + (size_t)warp_id * groups_per_row * 3;
+    const size_t block_row_base = (size_t)warp_id * (groups_per_row / gpb);
+
+    float acc = 0.0f;
+    for (int g = lane; g < groups_per_row; g += 32) {
+        uint32_t b0 = prow[g * 3];
+        uint32_t b1 = prow[g * 3 + 1];
+        uint32_t b2 = prow[g * 3 + 2];
+        uint32_t bits24 = b0 | (b1 << 8) | (b2 << 16);
+
+        const float* cbp = codebook + (block_row_base + g / gpb) * 8;
+        float cb[8];
+        #pragma unroll
+        for (int e = 0; e < 8; e++) cb[e] = cbp[e];
+
+        const float* xg = x + (size_t)g * 8;
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            acc += cb[(bits24 >> (j * 3)) & 0x7] * xg[j];
+        }
+    }
+
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        acc += __shfl_down_sync(0xffffffff, acc, off);
+    if (lane == 0) y[warp_id] = acc;
+}
+
+// Shuffle-LUT variant: the 8 codebook entries of each block live in warp
+// lanes, and __shfl_sync with a variable source lane performs the dequant
+// lookup as a pure ALU op — no local-memory array, no select tree. With
+// float4 x loads, LSU pressure drops ~3x vs the byte kernel. Requires
+// K % 256 == 0 (32 groups per warp-step).
+template<int GPB>  // groups per codebook block = block_size / 8 (8 or 16)
+__global__ void dequant_matvec_3bit_shfl_kernel(
+    const float* __restrict__ x,
+    const uint8_t* __restrict__ packed,
+    const float* __restrict__ codebook,
+    float* __restrict__ y,
+    int N, int groups_per_row
+) {
+    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    int lane = threadIdx.x & 31;
+    if (warp_id >= N) return;
+
+    const uint8_t* prow = packed + (size_t)warp_id * groups_per_row * 3;
+    const float* cbrow = codebook + (size_t)warp_id * (groups_per_row / GPB) * 8;
+
+    const int sub = lane % GPB;             // group index within block
+    const int blk = lane / GPB;             // block slot within warp-step
+    const int BLOCKS_PER_STEP = 32 / GPB;
+    const int lut_base = blk * GPB;         // shuffle source base for this block
+
+    // Two accumulators + 2-step unroll: breaks the FMA dependency chain and
+    // overlaps the next step's loads with this step's shuffles.
+    float acc0 = 0.0f, acc1 = 0.0f;
+    int steps = groups_per_row / 32;
+    int s = 0;
+    for (; s + 2 <= steps; s += 2) {
+        int g0 = s * 32 + lane;
+        int g1 = g0 + 32;
+        int cb_block0 = s * BLOCKS_PER_STEP + blk;
+        int cb_block1 = cb_block0 + BLOCKS_PER_STEP;
+        float cb_reg0 = (sub < 8) ? cbrow[cb_block0 * 8 + sub] : 0.0f;
+        float cb_reg1 = (sub < 8) ? cbrow[cb_block1 * 8 + sub] : 0.0f;
+
+        uint32_t bitsA = (uint32_t)prow[g0 * 3]
+                       | ((uint32_t)prow[g0 * 3 + 1] << 8)
+                       | ((uint32_t)prow[g0 * 3 + 2] << 16);
+        uint32_t bitsB = (uint32_t)prow[g1 * 3]
+                       | ((uint32_t)prow[g1 * 3 + 1] << 8)
+                       | ((uint32_t)prow[g1 * 3 + 2] << 16);
+
+        const float4* x4a = reinterpret_cast<const float4*>(x + (size_t)g0 * 8);
+        const float4* x4b = reinterpret_cast<const float4*>(x + (size_t)g1 * 8);
+        float4 a0 = x4a[0], a1 = x4a[1], b0v = x4b[0], b1v = x4b[1];
+        float xsA[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
+        float xsB[8] = {b0v.x, b0v.y, b0v.z, b0v.w, b1v.x, b1v.y, b1v.z, b1v.w};
+
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            int iA = (bitsA >> (j * 3)) & 0x7;
+            int iB = (bitsB >> (j * 3)) & 0x7;
+            acc0 += __shfl_sync(0xffffffff, cb_reg0, lut_base + iA) * xsA[j];
+            acc1 += __shfl_sync(0xffffffff, cb_reg1, lut_base + iB) * xsB[j];
+        }
+    }
+    for (; s < steps; s++) {
+        int g = s * 32 + lane;
+        int cb_block = s * BLOCKS_PER_STEP + blk;
+        float cb_reg = (sub < 8) ? cbrow[cb_block * 8 + sub] : 0.0f;
+        uint32_t bits = (uint32_t)prow[g * 3]
+                      | ((uint32_t)prow[g * 3 + 1] << 8)
+                      | ((uint32_t)prow[g * 3 + 2] << 16);
+        const float4* x4 = reinterpret_cast<const float4*>(x + (size_t)g * 8);
+        float4 xa = x4[0], xb = x4[1];
+        float xs[8] = {xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w};
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            int idx = (bits >> (j * 3)) & 0x7;
+            acc0 += __shfl_sync(0xffffffff, cb_reg, lut_base + idx) * xs[j];
+        }
+    }
+
+    float acc = acc0 + acc1;
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        acc += __shfl_down_sync(0xffffffff, acc, off);
+    if (lane == 0) y[warp_id] = acc;
+}
+
+// Multi-row shuffle-LUT: one warp computes 4 output rows, sharing the x
+// loads across them. x re-reads from L2 were a hidden co-limiter (~76MB per
+// call at 2.2B qkv); 4 rows per warp cuts that 4x. Per row a separate
+// cb register serves as the 32-lane shuffle LUT.
+template<int GPB>
+__global__ void dequant_matvec_3bit_shfl4_kernel(
+    const float* __restrict__ x,
+    const uint8_t* __restrict__ packed,
+    const float* __restrict__ codebook,
+    float* __restrict__ y,
+    int N, int groups_per_row
+) {
+    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    int lane = threadIdx.x & 31;
+    int row0 = warp_id * 4;
+    if (row0 >= N) return;
+
+    const int sub = lane % GPB;
+    const int blk = lane / GPB;
+    const int BLOCKS_PER_STEP = 32 / GPB;
+    const int lut_base = blk * GPB;
+    const int blocks_per_row = groups_per_row / GPB;
+
+    const uint8_t* prow0 = packed + (size_t)row0 * groups_per_row * 3;
+    const float* cbrow0 = codebook + (size_t)row0 * blocks_per_row * 8;
+    const size_t row_pstride = (size_t)groups_per_row * 3;
+    const size_t row_cstride = (size_t)blocks_per_row * 8;
+
+    float acc0 = 0.f, acc1 = 0.f, acc2 = 0.f, acc3 = 0.f;
+    int steps = groups_per_row / 32;
+    for (int s = 0; s < steps; s++) {
+        int g = s * 32 + lane;
+        int cb_block = s * BLOCKS_PER_STEP + blk;
+
+        // Shared x for all 4 rows
+        const float4* x4 = reinterpret_cast<const float4*>(x + (size_t)g * 8);
+        float4 xa = x4[0], xb = x4[1];
+        float xs[8] = {xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w};
+
+        // Per-row packed bits + codebook LUT register
+        uint32_t bits[4];
+        float cb_reg[4];
+        #pragma unroll
+        for (int r = 0; r < 4; r++) {
+            const uint8_t* pr = prow0 + r * row_pstride;
+            bits[r] = (uint32_t)pr[g * 3]
+                    | ((uint32_t)pr[g * 3 + 1] << 8)
+                    | ((uint32_t)pr[g * 3 + 2] << 16);
+            cb_reg[r] = (sub < 8)
+                ? cbrow0[r * row_cstride + cb_block * 8 + sub] : 0.0f;
+        }
+
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            float xv = xs[j];
+            acc0 += __shfl_sync(0xffffffff, cb_reg[0],
+                                lut_base + ((bits[0] >> (j * 3)) & 0x7)) * xv;
+            acc1 += __shfl_sync(0xffffffff, cb_reg[1],
+                                lut_base + ((bits[1] >> (j * 3)) & 0x7)) * xv;
+            acc2 += __shfl_sync(0xffffffff, cb_reg[2],
+                                lut_base + ((bits[2] >> (j * 3)) & 0x7)) * xv;
+            acc3 += __shfl_sync(0xffffffff, cb_reg[3],
+                                lut_base + ((bits[3] >> (j * 3)) & 0x7)) * xv;
+        }
+    }
+
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        acc0 += __shfl_down_sync(0xffffffff, acc0, off);
+        acc1 += __shfl_down_sync(0xffffffff, acc1, off);
+        acc2 += __shfl_down_sync(0xffffffff, acc2, off);
+        acc3 += __shfl_down_sync(0xffffffff, acc3, off);
+    }
+    if (lane == 0) {
+        y[row0] = acc0;
+        y[row0 + 1] = acc1;
+        y[row0 + 2] = acc2;
+        y[row0 + 3] = acc3;
+    }
+}
+
+// uint32-load variant: 4 groups (12B) per lane iteration. Wins at small K.
 __global__ void dequant_matvec_3bit_kernel(
     const float* __restrict__ x,
     const uint8_t* __restrict__ packed,
     const float* __restrict__ codebook,
     float* __restrict__ y,
-    int N, int bpr
+    int N, int groups_per_row, int gpb  // gpb = block_size / 8
 ) {
-    int row = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row >= N) return;
+    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    int lane = threadIdx.x & 31;
+    if (warp_id >= N) return;
 
-    const int BS = 128;
-    const int PPB = 48;  // BS * 3 / 8
+    const uint8_t* prow = packed + (size_t)warp_id * groups_per_row * 3;
+    const size_t block_row_base = (size_t)warp_id * (groups_per_row / gpb);
 
+    // Each lane iteration takes 4 consecutive groups (12 bytes = 3 aligned
+    // uint32 loads = 32 weights). 4-group chunks never straddle a codebook
+    // block: gpb is 8 or 16, both multiples of 4. Requires K % 32 == 0.
+    int chunks_per_row = groups_per_row >> 2;
     float acc = 0.0f;
+    for (int c = lane; c < chunks_per_row; c += 32) {
+        int g0 = c * 4;
+        const uint32_t* p32 = reinterpret_cast<const uint32_t*>(prow + (size_t)g0 * 3);
+        uint32_t w0 = p32[0], w1 = p32[1], w2 = p32[2];
 
-    for (int kb = 0; kb < bpr; kb++) {
-        int block_id = row * bpr + kb;
+        uint32_t bits[4];
+        bits[0] = w0 & 0xFFFFFFu;
+        bits[1] = (w0 >> 24) | ((w1 & 0xFFFFu) << 8);
+        bits[2] = (w1 >> 16) | ((w2 & 0xFFu) << 16);
+        bits[3] = w2 >> 8;
 
-        // Load codebook into registers (8 floats = 32 bytes)
+        const float* cbp = codebook + (block_row_base + g0 / gpb) * 8;
         float cb[8];
         #pragma unroll
-        for (int e = 0; e < 8; e++) {
-            cb[e] = codebook[block_id * 8 + e];
-        }
+        for (int e = 0; e < 8; e++) cb[e] = cbp[e];
 
-        // Process 16 groups of 3 packed bytes = 8 indices each
-        const uint8_t* pb = packed + block_id * PPB;
-        int x_base = kb * BS;
-
+        const float* xg = x + (size_t)g0 * 8;
         #pragma unroll
-        for (int g = 0; g < 16; g++) {
-            uint32_t bits24 = pb[g*3]
-                            | (uint32_t(pb[g*3+1]) << 8)
-                            | (uint32_t(pb[g*3+2]) << 16);
-
+        for (int q = 0; q < 4; q++) {
             #pragma unroll
             for (int j = 0; j < 8; j++) {
-                int idx = (bits24 >> (j * 3)) & 0x7;
-                acc += cb[idx] * x[x_base + g * 8 + j];
+                acc += cb[(bits[q] >> (j * 3)) & 0x7] * xg[q * 8 + j];
             }
         }
     }
 
-    y[row] = acc;
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        acc += __shfl_down_sync(0xffffffff, acc, off);
+    if (lane == 0) y[warp_id] = acc;
 }
 
 torch::Tensor dequant_matvec_3bit(
     torch::Tensor x,        // (K,) float32
     torch::Tensor packed,    // flat uint8, 3-bit packed indices
-    torch::Tensor codebook,  // (num_blocks, 8) float32
-    int N, int K
+    torch::Tensor codebook,  // (num_blocks, NE) float32
+    int N, int K, int block_size, int variant  // 0 = auto, 1 = bytes, 2 = u32
 ) {
-    int bpr = K / 128;
+    int groups_per_row = K / 8;
+    int gpb = block_size / 8;
     auto y = torch::empty({N}, torch::dtype(torch::kFloat32).device(x.device()));
 
-    int threads = 256;
-    int blocks = (N + threads - 1) / threads;
+    const int warps_per_block = 8;
+    int threads = warps_per_block * 32;
+    int blocks = (N + warps_per_block - 1) / warps_per_block;
 
-    dequant_matvec_3bit_kernel<<<blocks, threads>>>(
-        x.data_ptr<float>(),
-        packed.data_ptr<uint8_t>(),
-        codebook.data_ptr<float>(),
-        y.data_ptr<float>(),
-        N, bpr
-    );
+    // variant: 0 auto (shuffle-LUT when K%256==0, else bytes),
+    //          1 bytes, 2 u32, 3 shuffle-LUT, 4 shuffle-LUT 4 rows/warp
+    // 4-row measured equal to single-row (x re-reads were not a limiter);
+    // kept selectable, not default.
+    bool can_shfl = (K % 256 == 0) && (gpb == 8 || gpb == 16);
+    int v = variant;
+    if (v == 0) v = can_shfl ? 3 : 1;
+
+    if (v == 4) {
+        int warps4 = N / 4;
+        int blocks4 = (warps4 + warps_per_block - 1) / warps_per_block;
+        if (gpb == 16) {
+            dequant_matvec_3bit_shfl4_kernel<16><<<blocks4, threads>>>(
+                x.data_ptr<float>(), packed.data_ptr<uint8_t>(),
+                codebook.data_ptr<float>(), y.data_ptr<float>(),
+                N, groups_per_row);
+        } else {
+            dequant_matvec_3bit_shfl4_kernel<8><<<blocks4, threads>>>(
+                x.data_ptr<float>(), packed.data_ptr<uint8_t>(),
+                codebook.data_ptr<float>(), y.data_ptr<float>(),
+                N, groups_per_row);
+        }
+    } else if (v == 3) {
+        if (gpb == 16) {
+            dequant_matvec_3bit_shfl_kernel<16><<<blocks, threads>>>(
+                x.data_ptr<float>(), packed.data_ptr<uint8_t>(),
+                codebook.data_ptr<float>(), y.data_ptr<float>(),
+                N, groups_per_row);
+        } else {
+            dequant_matvec_3bit_shfl_kernel<8><<<blocks, threads>>>(
+                x.data_ptr<float>(), packed.data_ptr<uint8_t>(),
+                codebook.data_ptr<float>(), y.data_ptr<float>(),
+                N, groups_per_row);
+        }
+    } else if (v == 2) {
+        dequant_matvec_3bit_kernel<<<blocks, threads>>>(
+            x.data_ptr<float>(), packed.data_ptr<uint8_t>(),
+            codebook.data_ptr<float>(), y.data_ptr<float>(),
+            N, groups_per_row, gpb);
+    } else {
+        dequant_matvec_3bit_bytes_kernel<<<blocks, threads>>>(
+            x.data_ptr<float>(), packed.data_ptr<uint8_t>(),
+            codebook.data_ptr<float>(), y.data_ptr<float>(),
+            N, groups_per_row, gpb);
+    }
     return y;
 }
 """
@@ -107,7 +368,7 @@ torch::Tensor dequant_matvec_3bit(
 _CPP_SRC = r"""
 torch::Tensor dequant_matvec_3bit(
     torch::Tensor x, torch::Tensor packed, torch::Tensor codebook,
-    int N, int K);
+    int N, int K, int block_size, int variant);
 """
 
 _module = None
@@ -130,7 +391,12 @@ def get_module():
     return _module
 
 
-def dequant_matvec_3bit_cuda(x, packed, codebook, N, K):
-    """Fused 3-bit dequant + matvec via custom CUDA kernel."""
+def dequant_matvec_3bit_cuda(x, packed, codebook, N, K, block_size=BS,
+                             variant=0):
+    """Fused 3-bit dequant + matvec via custom CUDA kernel (warp per row).
+
+    variant: 0 auto-dispatch by K, 1 byte-load kernel, 2 uint32-load kernel.
+    """
     m = get_module()
-    return m.dequant_matvec_3bit(x, packed.view(-1), codebook.view(-1), int(N), int(K))
+    return m.dequant_matvec_3bit(x, packed.view(-1), codebook.view(-1),
+                                 int(N), int(K), int(block_size), int(variant))

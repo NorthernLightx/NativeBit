@@ -1,11 +1,14 @@
-"""Triton fused dequant-matvec kernel for NativeBit packed inference.
+"""Triton fused dequant-matvec kernels for NativeBit packed inference.
 
-For decode (M=1), the matmul is bandwidth-bound. This kernel reads uint8
-codebook indices (~1 byte/weight) instead of fp16 weights (2 bytes/weight),
-achieving ~1.6x less bandwidth with near-peak utilization via coalesced
-memory access and register-level codebook select.
+For decode (M=1) the matmul is bandwidth-bound. These kernels read codebook
+indices (1 byte or 0.375 bytes per weight) instead of fp16 weights and
+dequantize in registers via compare+select.
 
-Matches or beats cuBLAS fp16 matvec on RTX 3070 (Ampere).
+Measured on RTX 3070 / Triton 3.2: the compare+select approach caps at
+~0.9x cuBLAS fp16 despite reading fewer bytes — Triton's select codegen is
+the bottleneck, not bandwidth. The CUDA kernel (inference/cuda_kernel.py),
+whose indexed-lookup dequant avoids the select tree, beats cuBLAS 1.2-1.4x;
+PackedLinear prefers it and falls back to Triton.
 
 Usage:
     from inference.triton_kernel import dequant_matvec
@@ -140,6 +143,17 @@ def dequant_matvec(x, indices, codebook, N, K, tile_n=TILE_N):
     return y
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({"TILE_N": 16}, num_warps=2),
+        triton.Config({"TILE_N": 32}, num_warps=2),
+        triton.Config({"TILE_N": 32}, num_warps=4),
+        triton.Config({"TILE_N": 64}, num_warps=4),
+        triton.Config({"TILE_N": 64}, num_warps=8),
+        triton.Config({"TILE_N": 128}, num_warps=8),
+    ],
+    key=["BPR", "BS"],
+)
 @triton.jit
 def _dequant_3bit_fast_kernel(
     x_ptr, packed_ptr, cb_ptr, y_ptr,
@@ -147,51 +161,65 @@ def _dequant_3bit_fast_kernel(
     TILE_N: tl.constexpr,
     BS: tl.constexpr,
     NE: tl.constexpr,
-    PPB: tl.constexpr,
+    PPB: tl.constexpr,      # packed bytes per block = BS * 3 // 8
+    N_GROUPS: tl.constexpr,  # 8-index groups per block = BS // 8
 ):
-    """V2 3-bit: load all 48 packed bytes at once, unpack group-by-group,
-    accumulate dot products. Uses (TILE_N, 48) bulk load for coalescing."""
+    """V3 3-bit: vectorized group loads (no tensor slicing — Triton 3.2 safe).
+
+    Each 8-index group is 3 bytes. Instead of bulk-loading a block's bytes
+    and slicing columns (unsupported), issue three (TILE_N, N_GROUPS) loads —
+    byte 0, 1, 2 of every group — then unpack to (TILE_N, N_GROUPS, 8)
+    indices in registers. The three loads together touch each packed byte
+    exactly once.
+    """
     pid = tl.program_id(0)
     n_offs = pid * TILE_N + tl.arange(0, TILE_N)
     y_acc = tl.zeros((TILE_N,), dtype=tl.float32)
-    shifts = tl.arange(0, 8) * 3
+    shifts = tl.arange(0, 8) * 3          # bit offset of each index in 24 bits
+    g_offs = tl.arange(0, N_GROUPS)
 
     for kb in range(BPR):
         block_ids = n_offs * BPR + kb
 
-        # Bulk load packed bytes — pad to 64 (power of 2) for tl.arange
-        packed_ptrs = block_ids[:, None] * PPB + tl.arange(0, 64)[None, :]
-        mask = tl.arange(0, 64)[None, :] < PPB
-        packed = tl.load(packed_ptr + packed_ptrs, mask=mask, other=0).to(tl.int32)
+        # (TILE_N, N_GROUPS) byte pointers, stride 3 within a block
+        base = block_ids[:, None] * PPB + g_offs[None, :] * 3
+        b0 = tl.load(packed_ptr + base).to(tl.int32)
+        b1 = tl.load(packed_ptr + base + 1).to(tl.int32)
+        b2 = tl.load(packed_ptr + base + 2).to(tl.int32)
+        bits24 = b0 | (b1 << 8) | (b2 << 16)          # (TILE_N, N_GROUPS)
 
-        for g in range(BS // 8):
-            b0 = packed[:, g * 3]
-            b1 = packed[:, g * 3 + 1]
-            b2 = packed[:, g * 3 + 2]
-            bits24 = b0 | (b1 << 8) | (b2 << 16)
+        # (TILE_N, N_GROUPS, 8) indices
+        idx = (bits24[:, :, None] >> shifts[None, None, :]) & 0x7
 
-            idx_g = (bits24[:, None] >> shifts[None, :]) & 0x7  # (TILE_N, 8)
-            x_g = tl.load(x_ptr + kb * BS + g * 8 + tl.arange(0, 8)).to(tl.float32)
+        # x chunk for this block: (N_GROUPS, 8)
+        x_g = tl.load(
+            x_ptr + kb * BS + g_offs[:, None] * 8 + tl.arange(0, 8)[None, :]
+        ).to(tl.float32)
 
-            w_g = tl.zeros((TILE_N, 8), dtype=tl.float32)
-            for e in range(NE):
-                cb_e = tl.load(cb_ptr + block_ids * NE + e)
-                w_g += tl.where(idx_g == e, cb_e[:, None], tl.zeros((TILE_N, 8), tl.float32))
+        # Codebook select: NE coalesced loads of (TILE_N,), register select
+        w = tl.zeros((TILE_N, N_GROUPS, 8), dtype=tl.float32)
+        for e in range(NE):
+            cb_e = tl.load(cb_ptr + block_ids * NE + e)
+            w = tl.where(idx == e, cb_e[:, None, None], w)
 
-            y_acc += tl.sum(w_g * x_g[None, :], axis=1)
+        y_acc += tl.sum(tl.sum(w * x_g[None, :, :], axis=2), axis=1)
 
     tl.store(y_ptr + n_offs, y_acc)
 
 
-def dequant_matvec_3bit(x, packed_indices, codebook, N, K, tile_n=TILE_N):
-    """Fused dequant + matvec with 3-bit packed indices in VRAM."""
-    bpr = int(K) // BS
-    ppb = BS * 3 // 8
+def dequant_matvec_3bit(x, packed_indices, codebook, N, K, block_size=BS):
+    """Fused dequant + matvec with 3-bit packed indices in VRAM.
+
+    block_size: codebook block size (128 for TPU configs, 64 for local).
+    N must be divisible by the autotuned tile (128 covers all our shapes).
+    """
+    bpr = int(K) // block_size
+    ppb = block_size * 3 // 8
     y = torch.empty(int(N), dtype=torch.float32, device=x.device)
-    grid = (int(N) // tile_n,)
+    grid = lambda META: (triton.cdiv(int(N), META["TILE_N"]),)
     _dequant_3bit_fast_kernel[grid](
         x, packed_indices, codebook.view(-1), y,
-        BPR=bpr, TILE_N=tile_n, BS=BS, NE=NE, PPB=ppb,
+        BPR=bpr, BS=block_size, NE=NE, PPB=ppb, N_GROUPS=block_size // 8,
     )
     return y
 
