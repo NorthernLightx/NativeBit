@@ -178,7 +178,18 @@ def download_wikitext103(data_dir: str = "data") -> Path:
 
 
 def load_wikitext103_tokens(split: str = "train", data_dir: str = "data") -> torch.Tensor:
-    """Load and tokenize a WikiText-103 split using tiktoken gpt2 encoding."""
+    """Load a WikiText-103 split as token ids (tiktoken gpt2 encoding).
+
+    Prefers the tokenized cache shared with the JAX backend
+    (data/wikitext103/{split}.tokens.bin, raw int32) so both backends —
+    and all published PPL numbers — see the identical token stream.
+    Falls back to tokenizing the raw text and writing that cache.
+    """
+    cache_path = Path(data_dir) / "wikitext103" / f"{split}.tokens.bin"
+    if cache_path.exists():
+        buf = bytearray(cache_path.read_bytes())
+        return torch.frombuffer(buf, dtype=torch.int32).to(torch.long)
+
     dataset_dir = download_wikitext103(data_dir)
 
     fname = {"train": "wiki.train.tokens", "valid": "wiki.valid.tokens", "test": "wiki.test.tokens"}
@@ -189,6 +200,16 @@ def load_wikitext103_tokens(split: str = "train", data_dir: str = "data") -> tor
 
     enc = tiktoken.get_encoding("gpt2")
     tokens = enc.encode(text, allowed_special={"<|endoftext|>"})
+
+    # Cache in the shared format (int32, same layout the JAX loader writes).
+    # Note: this text-cleanup path differs slightly from the JAX download
+    # path — on a fresh machine the cache is self-consistent but not
+    # bit-identical to one produced by nativebit_jax.train.load_tokens.
+    import array
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(cache_path, "wb") as f:
+        array.array("i", tokens).tofile(f)
+
     return torch.tensor(tokens, dtype=torch.long)
 
 
