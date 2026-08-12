@@ -270,37 +270,63 @@ class PackedLinear(torch.nn.Module):
         x_flat = x.reshape(-1, self.in_features)
 
         if x_flat.shape[0] == 1:
-            # Try CUDA kernel (register-indexed lookup), fall back to Triton
+            # CUDA kernel needs fp32 x — without the cast the dtype mismatch
+            # raised and decode silently fell back to the slower Triton path
+            x_row = x_flat[0].float()
             try:
                 from inference.cuda_kernel import dequant_matvec_3bit_cuda
                 y = dequant_matvec_3bit_cuda(
-                    x_flat[0], self.packed_indices, self.codebook,
+                    x_row, self.packed_indices, self.codebook,
                     self.out_features, self.in_features,
                 )
             except Exception:
                 y = dequant_matvec_3bit(
-                    x_flat[0], self.packed_indices, self.codebook,
+                    x_row, self.packed_indices, self.codebook,
                     self.out_features, self.in_features,
                 )
-            return y.reshape(*shape[:-1], self.out_features)
+            return y.to(x.dtype).reshape(*shape[:-1], self.out_features)
         else:
-            # Batched: unpack + reconstruct + matmul
-            num_blocks = self.codebook.shape[0]
-            # Unpack 3-bit to uint8 for gather
-            n_groups = self.packed_indices.shape[0] // 3
-            packed = self.packed_indices.reshape(n_groups, 3).to(torch.int32)
-            bits24 = packed[:, 0] | (packed[:, 1] << 8) | (packed[:, 2] << 16)
-            indices = torch.zeros(n_groups, 8, dtype=torch.int64, device=x.device)
-            for j in range(8):
-                indices[:, j] = (bits24 >> (j * 3)) & 0x7
-            total_idx = num_blocks * BS
-            indices = indices.reshape(-1)[:total_idx].reshape(num_blocks, BS)
-            block_idx = torch.arange(num_blocks, device=x.device).unsqueeze(1)
-            total = self.out_features * self.in_features
-            w = self.codebook[block_idx, indices].reshape(-1)[:total]
-            w = w.reshape(self.out_features, self.in_features)
-            y = x_flat @ w.T
-            return y.reshape(*shape[:-1], self.out_features)
+            # Batched (prefill/eval). Reconstructing the dense weight costs
+            # ~750ms per forward at 2.2B, so eval workloads want it cached —
+            # but the fp16 copy is 2 bytes/weight and cancels the whole point
+            # of a packed model (2.8 GB -> 6.9 GB at 2.2B), so caching is
+            # opt-in via enable_weight_cache().
+            if getattr(self, "_cache_weights", False):
+                if not hasattr(self, "_w_cache"):
+                    self._w_cache = self._reconstruct_weight().to(torch.float16)
+                w = self._w_cache
+            else:
+                w = self._reconstruct_weight().to(torch.float16)
+            y = x_flat.to(torch.float16) @ w.T
+            return y.to(x.dtype).reshape(*shape[:-1], self.out_features)
+
+    def enable_weight_cache(self, enabled: bool = True) -> None:
+        """Trade VRAM for batched-forward speed (eval/prefill workloads).
+
+        Costs 2 bytes/weight on top of the packed indices. Leave off for
+        decode-only serving, where the packed path never needs dense weights.
+        """
+        self._cache_weights = enabled
+        if not enabled and hasattr(self, "_w_cache"):
+            del self._w_cache
+
+    def _reconstruct_weight(self):
+        """Dequantize packed indices to a dense weight (out_features, in_features)."""
+        num_blocks = self.codebook.shape[0]
+        n_groups = self.packed_indices.shape[0] // 3
+        packed = self.packed_indices.reshape(n_groups, 3).to(torch.int32)
+        bits24 = packed[:, 0] | (packed[:, 1] << 8) | (packed[:, 2] << 16)
+        indices = torch.zeros(n_groups, 8, dtype=torch.int64,
+                              device=self.packed_indices.device)
+        for j in range(8):
+            indices[:, j] = (bits24 >> (j * 3)) & 0x7
+        total_idx = num_blocks * BS
+        indices = indices.reshape(-1)[:total_idx].reshape(num_blocks, BS)
+        block_idx = torch.arange(num_blocks,
+                                 device=self.packed_indices.device).unsqueeze(1)
+        total = self.out_features * self.in_features
+        w = self.codebook[block_idx, indices].reshape(-1)[:total]
+        return w.reshape(self.out_features, self.in_features)
 
     @staticmethod
     def from_packed(indices_np, codebook_np, weight_shape, device='cuda'):

@@ -26,6 +26,13 @@ try:
 except ImportError:
     pass
 
+# Stable per-user build dir. The default lives under AppData, which Windows
+# Store Python virtualizes per-app — builds from different interpreters or
+# an elevated process poison it and later rebuilds fail with
+# "ninja: error: loading 'build.ninja'".
+os.environ.setdefault(
+    "TORCH_EXTENSIONS_DIR", os.path.join(os.path.expanduser("~"), ".nativebit_ext"))
+
 # Find MSVC cl.exe if not on PATH
 import glob
 _msvc_paths = glob.glob(
@@ -43,6 +50,7 @@ NE = 8
 _CUDA_SRC = r"""
 #include <torch/extension.h>
 #include <cuda_fp16.h>
+#include <ATen/cuda/CUDAContext.h>
 
 // One WARP per output row, lanes stride across the row's 8-index groups.
 // Byte-load variant: adjacent lanes read adjacent 3-byte chunks (coalesced).
@@ -250,6 +258,68 @@ __global__ void dequant_matvec_3bit_shfl4_kernel(
     }
 }
 
+// Select-tree variant: uint32-chunk loads (4 groups = 12B = 3 aligned u32)
+// with the codebook in 8 named registers and a 7-select tree per weight.
+// The uint32 kernel's flaw was its dynamically-indexed local array (every
+// access an LSU op); selects run on the wide FP pipe instead, and the 8
+// codebook loads amortize over a full 32-weight chunk. ~0.6 LSU/weight.
+__global__ void dequant_matvec_3bit_seltree_kernel(
+    const float* __restrict__ x,
+    const uint8_t* __restrict__ packed,
+    const float* __restrict__ codebook,
+    float* __restrict__ y,
+    int N, int groups_per_row, int gpb
+) {
+    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    int lane = threadIdx.x & 31;
+    if (warp_id >= N) return;
+
+    const uint8_t* prow = packed + (size_t)warp_id * groups_per_row * 3;
+    const size_t block_row_base = (size_t)warp_id * (groups_per_row / gpb);
+
+    int chunks_per_row = groups_per_row >> 2;  // 4-group chunks
+    float acc = 0.0f;
+    for (int c = lane; c < chunks_per_row; c += 32) {
+        int g0 = c * 4;
+        const uint32_t* p32 = reinterpret_cast<const uint32_t*>(prow + (size_t)g0 * 3);
+        uint32_t w0 = p32[0], w1 = p32[1], w2 = p32[2];
+
+        uint32_t bits[4];
+        bits[0] = w0 & 0xFFFFFFu;
+        bits[1] = (w0 >> 24) | ((w1 & 0xFFFFu) << 8);
+        bits[2] = (w1 >> 16) | ((w2 & 0xFFu) << 16);
+        bits[3] = w2 >> 8;
+
+        // 4-group chunks never straddle a block (gpb is 8 or 16)
+        const float* cbp = codebook + (block_row_base + g0 / gpb) * 8;
+        float c0 = cbp[0], c1 = cbp[1], c2 = cbp[2], c3 = cbp[3];
+        float c4 = cbp[4], c5 = cbp[5], c6 = cbp[6], c7 = cbp[7];
+
+        const float4* x4 = reinterpret_cast<const float4*>(x + (size_t)g0 * 8);
+
+        #pragma unroll
+        for (int q = 0; q < 4; q++) {
+            float4 xa = x4[q * 2], xb = x4[q * 2 + 1];
+            float xs[8] = {xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w};
+            uint32_t b = bits[q];
+            #pragma unroll
+            for (int j = 0; j < 8; j++) {
+                uint32_t idx = (b >> (j * 3)) & 0x7;
+                float lo = (idx & 2) ? ((idx & 1) ? c3 : c2)
+                                     : ((idx & 1) ? c1 : c0);
+                float hi = (idx & 2) ? ((idx & 1) ? c7 : c6)
+                                     : ((idx & 1) ? c5 : c4);
+                acc += ((idx & 4) ? hi : lo) * xs[j];
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        acc += __shfl_down_sync(0xffffffff, acc, off);
+    if (lane == 0) y[warp_id] = acc;
+}
+
 // uint32-load variant: 4 groups (12B) per lane iteration. Wins at small K.
 __global__ void dequant_matvec_3bit_kernel(
     const float* __restrict__ x,
@@ -311,52 +381,59 @@ torch::Tensor dequant_matvec_3bit(
     int groups_per_row = K / 8;
     int gpb = block_size / 8;
     auto y = torch::empty({N}, torch::dtype(torch::kFloat32).device(x.device()));
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     const int warps_per_block = 8;
     int threads = warps_per_block * 32;
     int blocks = (N + warps_per_block - 1) / warps_per_block;
 
     // variant: 0 auto (shuffle-LUT when K%256==0, else bytes),
-    //          1 bytes, 2 u32, 3 shuffle-LUT, 4 shuffle-LUT 4 rows/warp
+    //          1 bytes, 2 u32, 3 shuffle-LUT, 4 shuffle-LUT 4 rows/warp,
+    //          5 select-tree u32
     // 4-row measured equal to single-row (x re-reads were not a limiter);
     // kept selectable, not default.
     bool can_shfl = (K % 256 == 0) && (gpb == 8 || gpb == 16);
     int v = variant;
     if (v == 0) v = can_shfl ? 3 : 1;
 
-    if (v == 4) {
+    if (v == 5) {
+        dequant_matvec_3bit_seltree_kernel<<<blocks, threads, 0, stream>>>(
+            x.data_ptr<float>(), packed.data_ptr<uint8_t>(),
+            codebook.data_ptr<float>(), y.data_ptr<float>(),
+            N, groups_per_row, gpb);
+    } else if (v == 4) {
         int warps4 = N / 4;
         int blocks4 = (warps4 + warps_per_block - 1) / warps_per_block;
         if (gpb == 16) {
-            dequant_matvec_3bit_shfl4_kernel<16><<<blocks4, threads>>>(
+            dequant_matvec_3bit_shfl4_kernel<16><<<blocks4, threads, 0, stream>>>(
                 x.data_ptr<float>(), packed.data_ptr<uint8_t>(),
                 codebook.data_ptr<float>(), y.data_ptr<float>(),
                 N, groups_per_row);
         } else {
-            dequant_matvec_3bit_shfl4_kernel<8><<<blocks4, threads>>>(
+            dequant_matvec_3bit_shfl4_kernel<8><<<blocks4, threads, 0, stream>>>(
                 x.data_ptr<float>(), packed.data_ptr<uint8_t>(),
                 codebook.data_ptr<float>(), y.data_ptr<float>(),
                 N, groups_per_row);
         }
     } else if (v == 3) {
         if (gpb == 16) {
-            dequant_matvec_3bit_shfl_kernel<16><<<blocks, threads>>>(
+            dequant_matvec_3bit_shfl_kernel<16><<<blocks, threads, 0, stream>>>(
                 x.data_ptr<float>(), packed.data_ptr<uint8_t>(),
                 codebook.data_ptr<float>(), y.data_ptr<float>(),
                 N, groups_per_row);
         } else {
-            dequant_matvec_3bit_shfl_kernel<8><<<blocks, threads>>>(
+            dequant_matvec_3bit_shfl_kernel<8><<<blocks, threads, 0, stream>>>(
                 x.data_ptr<float>(), packed.data_ptr<uint8_t>(),
                 codebook.data_ptr<float>(), y.data_ptr<float>(),
                 N, groups_per_row);
         }
     } else if (v == 2) {
-        dequant_matvec_3bit_kernel<<<blocks, threads>>>(
+        dequant_matvec_3bit_kernel<<<blocks, threads, 0, stream>>>(
             x.data_ptr<float>(), packed.data_ptr<uint8_t>(),
             codebook.data_ptr<float>(), y.data_ptr<float>(),
             N, groups_per_row, gpb);
     } else {
-        dequant_matvec_3bit_bytes_kernel<<<blocks, threads>>>(
+        dequant_matvec_3bit_bytes_kernel<<<blocks, threads, 0, stream>>>(
             x.data_ptr<float>(), packed.data_ptr<uint8_t>(),
             codebook.data_ptr<float>(), y.data_ptr<float>(),
             N, groups_per_row, gpb);

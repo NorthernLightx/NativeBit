@@ -89,12 +89,15 @@ class CausalAttention(nn.Module):
             v_buf[:, :, cache_len:cache_len+T] = v
             new_len = cache_len + T
             scale = self.head_dim ** -0.5
-            attn = torch.einsum('bhqd,bhkd->bhqk', q * scale, k_buf)
+            # Cache buffers are fp32; q may be fp16 (fp16 weights) — keep the
+            # attention math in fp32 and cast back below
+            attn = torch.einsum('bhqd,bhkd->bhqk', (q * scale).float(), k_buf)
             q_pos = cache_len + torch.arange(T, device=x.device)
             k_pos = torch.arange(k_buf.shape[2], device=x.device)
             mask = (k_pos[None, :] <= q_pos[:, None]) & (k_pos[None, :] < new_len)
             attn = attn.masked_fill(~mask[None, None], torch.finfo(attn.dtype).min)
             out = torch.einsum('bhqk,bhkd->bhqd', F.softmax(attn, dim=-1), v_buf)
+            out = out.to(x.dtype)
             new_cache = (k_buf, v_buf, new_len)
         else:
             # Standard cross-position causal attention.
