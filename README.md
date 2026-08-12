@@ -2,7 +2,7 @@
 
 [![tests](https://github.com/NorthernLightx/NativeBit/actions/workflows/tests.yml/badge.svg)](https://github.com/NorthernLightx/NativeBit/actions/workflows/tests.yml)
 
-Quantization-aware training for LLMs with per-block learned codebooks. At 2.2B parameters and 3-bit precision, a fine-tuned NativeBit model matches its float counterpart on WikiText-103 (30.50 vs 30.51 perplexity) while beating post-hoc RTN quantization (31.33).
+Quantization-aware training for LLMs with per-block learned codebooks. At 2.2B parameters and 3-bit precision, a fine-tuned NativeBit model matches its float counterpart on WikiText-103 (30.50 vs 30.51 perplexity) while beating post-hoc RTN quantization (31.33). The packed model then decodes 1.9× faster than fp16 in 1.8 GB of weights, because 3-bit weights move fewer bytes through the memory system that single-token decode is bound by.
 
 ## Result
 
@@ -18,6 +18,32 @@ WikiText-103 perplexity, 2.2B model (26 layers, 2560 hidden, 6912 FFN; hidden an
 The QAT recipe — load a trained float checkpoint, then fine-tune with NativeBit active for 5K steps using a commitment loss and canonical VQ-VAE EMA — is what closes the gap. Training NativeBit from scratch at this scale leaves a sizeable gap to float that post-hoc RTN doesn't have.
 
 Compression: packed NativeBit 2.2B is 1.70 GB vs 8.76 GB float, about 5.1× smaller on disk.
+
+### Smaller scales, one consumer GPU
+
+The same recipe on an RTX 3070, WikiText-103 in-domain, PyTorch backend. QAT spends 5K extra steps that the float baseline never sees, so the baseline here is float trained for those same 5K extra steps at the same learning rate.
+
+| Test PPL, 3-bit | 48M | 76M |
+|-----------------|-----|-----|
+| Float + 5K (baseline) | 23.36 | 22.09 |
+| Post-hoc RTN | 25.99 (+11.3%) | 24.15 (+9.3%) |
+| Post-hoc k-means | 26.56 (+13.7%) | 24.64 (+11.5%) |
+| **NativeBit QAT** | **24.36 (+4.3%)** | **22.81 (+3.3%)** |
+
+The continued-float control changes the picture in both directions. Those 5K extra steps buy the float model about 1.5% perplexity, so QAT's gap to float is wider than it looks against the shorter baseline. They also spread the weight distribution slightly, which makes post-hoc quantization worse (RTN goes from +9.0% to +11.3% at 48M). QAT co-adapts to the codebook instead, so its margin over the best post-hoc method grows to 7.0 points at 48M and 6.0 at 76M.
+
+Gap to float shrinks with scale: +4.3% at 48M, +3.3% at 76M, −0.03% at 2.2B. The 2.2B point predates the continued-float control and hasn't been re-run against it.
+
+### Downstream tasks
+
+Perplexity parity can hide capability loss, so the 2.2B QAT model was also run on full test sets:
+
+| Task | Float fp16 | NativeBit QAT 3-bit | Gap |
+|------|-----------|---------------------|-----|
+| LAMBADA (5,153) | 29.79% | 29.65% | −0.14 pt |
+| HellaSwag (10,042) | 30.60% | 30.44% | −0.16 pt |
+
+Both gaps are noise at these sample sizes. The absolute numbers are low because the model saw 1.3B training tokens, far short of what these benchmarks usually assume; the claim here is the gap, not the score.
 
 ## What NativeBit does
 
@@ -40,8 +66,8 @@ nativebit_jax/         JAX/Flax backend (TPU training at 2.2B scale)
   train.py             Training loop with QAT init, commitment loss,
                        periodic validation, full-config JSONL logging
   codebook_utils.py    Codebook init + EMA helpers
-nativebit/             PyTorch backend (local GPU development)
-inference/             Packed inference (Triton + CUDA dequant kernels)
+nativebit/             PyTorch backend (local GPU training, same QAT recipe)
+inference/             Packed inference (CUDA dequant kernel, CUDA-graph decode)
 configs/tpu.py         Model configs (25M → 2.2B)
 benchmarks/            Post-hoc quantization baselines for comparison
 tests/                 Unit tests (attention, quant-reg, canonical EMA, QAT init)
@@ -136,11 +162,28 @@ python inference/pack.py logs/2b_nb_qat_params.npz --out inference/2b_nb.nbpack.
 # Generate (JAX / TPU / CPU)
 python inference/generate.py inference/2b_nb.nbpack.npz --packed --benchmark
 
-# Generate (PyTorch + Triton dequant kernel on GPU)
-python inference/generate_torch.py inference/2b_nb.nbpack.npz --benchmark
+# Generate with CUDA-graph decode (PyTorch, GPU)
+python inference/graph_decode.py inference/2b_nb.nbpack.npz --n-generate 256
+
+# Float vs NativeBit decode comparison
+python inference/bench_decode_2b.py --nb inference/2b_nb.nbpack.npz \
+    --float-npz logs/2b_float_params.npz
 ```
 
-The packed `generate_torch.py` path uses a fused dequant-matvec kernel that reads uint8 codebook indices directly from VRAM, avoiding the materialized-weight-matrix bottleneck of single-token decode.
+Decode never materializes a weight matrix. A fused CUDA kernel reads 3-bit packed indices straight from VRAM and dequantizes in registers, and the whole per-token step is captured as a CUDA graph so it replays in one launch instead of ~130.
+
+2.2B on an RTX 3070, greedy decode, median of three warmed runs:
+
+| | NativeBit 3-bit | Float fp16 |
+|--|-----------------|-----------|
+| Weights | 1.80 GB | 4.38 GB |
+| Peak VRAM | 2.84 GB | 5.00 GB |
+| Time to first token | 49 ms | 75 ms |
+| Decode | 123.2 tok/s (8.1 ms/tok) | 66.1 tok/s (15.1 ms/tok) |
+
+Two things dominate that decode number. Single-token matmuls are bandwidth-bound, so reading 0.44 bytes per weight instead of 2 is most of the win; the kernel sustains about 300 GB/s of the card's 448 GB/s peak, and Nsight puts both the memory and compute pipes near 80%, which is where a kernel stops being worth tuning. The rest is launch overhead: eager PyTorch decode spends roughly 95% of its wall clock in Python and kernel launches, which the graph removes.
+
+Benchmark carefully on a desktop GPU. The first timed decode after idle runs at a third of steady-state speed while clocks ramp from 210 MHz to about 1920 MHz, which is enough to produce contradictory numbers for identical code. Warm up first, then take a median.
 
 ## Architecture notes
 
@@ -156,13 +199,15 @@ The biggest matrix, the embedding, is left unquantized partly because it's tied 
 
 ## Caveats
 
-Validated at 2.2B only. The 125M and 350M results in git history used an earlier JAX implementation with the cross-head/cross-position attention bug; they don't reproduce and shouldn't be cited.
+Three scales: 48M and 76M locally in PyTorch, 2.2B on TPU in JAX. The two backends are checked against each other by unit test (`tests/test_qat_torch_parity.py` pins the PyTorch canonical EMA and commitment loss to the JAX reference within 1e-4), but no single model has been trained on both. The 125M and 350M results in git history used an earlier JAX implementation with the cross-head/cross-position attention bug; they don't reproduce and shouldn't be cited.
+
+The 48M and 76M points are in-domain WikiText-103, the 2.2B point is OpenWebText training with WikiText-103 cross-eval. Perplexities are not comparable across those two settings; the gap to float is.
 
 QAT is the recommended recipe. NativeBit from-scratch at 2.2B lands +12.2% above float at 3-bit, which is worse than post-hoc RTN. The method's claim is "trainable quantization that matches float via short fine-tuning," not "matches float from random init."
 
 2-bit untested with fixed attention. The earlier 2-bit wins over k-means post-hoc came from pre-fix runs.
 
-Single training dataset (OpenWebText), single evaluation point (WikiText-103 cross-eval), single seed. Other domains (code, multilingual) and multi-seed variance are not measured.
+Single seed per point, and no multi-seed variance estimate at the local scales. Other domains (code, multilingual) are not measured.
 
 Baseline numbers in the table come from a 2026-04-18 validation: float, RTN, and k-means rows from `benchmarks/benchmark_posthoc_2b.py` on `2b_float_fixed_params.npz`; the from-scratch and QAT WikiText-103 cross-evals from their respective training logs. A fresh single-CPU re-eval of the float baseline lands at 30.50 (consistent with 30.51 within eval-protocol noise). Running the full post-hoc sweep at 2.2B needs more than ~32 GB host RAM or a TPU — the script holds the float and quantized params live simultaneously.
 
