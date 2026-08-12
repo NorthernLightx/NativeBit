@@ -17,6 +17,8 @@ logs/
 run*.log
 results*.tsv
 *.png
+# README figures are tracked; generated log plots are not
+!assets/*.png
 
 # IDE
 .vscode/

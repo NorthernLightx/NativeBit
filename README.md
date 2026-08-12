@@ -4,6 +4,8 @@
 
 Quantization-aware training for LLMs with per-block learned codebooks. At 2.2B parameters and 3-bit precision, a fine-tuned NativeBit model matches its float counterpart on WikiText-103 (30.50 vs 30.51 perplexity) while beating post-hoc RTN quantization (31.33). The packed model then decodes 1.9× faster than fp16 in 1.8 GB of weights, because 3-bit weights move fewer bytes through the memory system that single-token decode is bound by.
 
+![3-bit quality gap to float across model scale](assets/scaling_gap.png)
+
 ## Result
 
 WikiText-103 perplexity, 2.2B model (26 layers, 2560 hidden, 6912 FFN; hidden and FFN sizes match BitNet b1.58-2B-4T).
@@ -75,6 +77,21 @@ infra/                 TPU provisioning + training launch scripts
 ```
 
 The two key files are `nativebit_jax/layers.py` (NativeBitDense + `requantize_params` + `compute_quant_reg` + `compute_quant_diagnostics`) and `nativebit_jax/train.py` (the training loop). The JAX backend is the primary one — it's what produced the paper results on v6e-8 TPU. The PyTorch backend is maintained for local GPU iteration.
+
+## Install
+
+Python 3.10–3.12. No HuggingFace Transformers, no GPTQ/AWQ libraries; the model, the quantizer, and the kernels are all in this repo.
+
+```bash
+git clone https://github.com/NorthernLightx/NativeBit && cd NativeBit
+pip install -e .
+
+# PyTorch backend (local GPU): torch>=2.0, tiktoken, matplotlib, tqdm
+# JAX backend (TPU):           pip install -e ".[jax]"
+# Test extras:                 pip install -e ".[ci]"
+```
+
+Packed-inference kernels are compiled on first use and need a CUDA toolkit plus a host compiler (MSVC on Windows, gcc on Linux). Everything else runs on CPU, slowly. Local training results here came from an RTX 3070 with 8 GB; the 2.2B runs came from a TPU v6e-8.
 
 ## Reproducing
 

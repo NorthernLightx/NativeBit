@@ -18,6 +18,12 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest"]
+jax = [
+    "jax",
+    "flax",
+    "optax",
+    "ml_dtypes",
+]
 ci = [
     "pytest",
     "tiktoken",
