@@ -17,13 +17,15 @@ WikiText-103 perplexity, 2.2B model (26 layers, 2560 hidden, 6912 FFN; hidden an
 | NativeBit from-scratch (20K steps) | 34.23 | +12.2% |
 | **NativeBit via QAT (5K steps)** | **30.50** | **−0.03%** |
 
+QAT spends 5K steps that the float baseline never sees. At the two smaller scales below, where the control was affordable, giving float those same steps moves the comparison; this 2.2B table is the uncontrolled version, and the next section quantifies the direction.
+
 The QAT recipe — load a trained float checkpoint, then fine-tune with NativeBit active for 5K steps using a commitment loss and canonical VQ-VAE EMA — is what closes the gap. Training NativeBit from scratch at this scale leaves a sizeable gap to float that post-hoc RTN doesn't have.
 
 Compression: packed NativeBit 2.2B is 1.70 GB vs 8.76 GB float, about 5.1× smaller on disk.
 
 ### Smaller scales, one consumer GPU
 
-The same recipe on an RTX 3070, WikiText-103 in-domain, PyTorch backend. QAT spends 5K extra steps that the float baseline never sees, so the baseline here is float trained for those same 5K extra steps at the same learning rate.
+The same recipe on an RTX 3070, WikiText-103 in-domain, PyTorch backend. The baseline here is the controlled one: float trained for the same 5K extra steps at the same learning rate, so both sides see the same token budget.
 
 | Test PPL, 3-bit | 48M | 76M |
 |-----------------|-----|-----|
@@ -32,9 +34,13 @@ The same recipe on an RTX 3070, WikiText-103 in-domain, PyTorch backend. QAT spe
 | Post-hoc k-means | 26.56 (+13.7%) | 24.64 (+11.5%) |
 | **NativeBit QAT** | **24.36 (+4.3%)** | **22.81 (+3.3%)** |
 
-The continued-float control changes the picture in both directions. Those 5K extra steps buy the float model about 1.5% perplexity, so QAT's gap to float is wider than it looks against the shorter baseline. They also spread the weight distribution slightly, which makes post-hoc quantization worse (RTN goes from +9.0% to +11.3% at 48M). QAT co-adapts to the codebook instead, so its margin over the best post-hoc method grows to 7.0 points at 48M and 6.0 at 76M.
+The control changes the picture in both directions. Those extra steps buy the float model a little perplexity, so QAT's gap to float is wider than it looks against the shorter baseline. They also spread the weight distribution slightly, which makes post-hoc quantization worse (RTN goes from +9.0% to +11.3% at 48M). QAT co-adapts to the codebook instead, so its margin over the best post-hoc method grows to 7.0 points at 48M and 6.0 at 76M.
 
-Gap to float shrinks with scale: +4.3% at 48M, +3.3% at 76M, −0.03% at 2.2B. The 2.2B point predates the continued-float control and hasn't been re-run against it.
+Gap to float shrinks with scale: +4.3% at 48M, +3.3% at 76M, −0.03% at 2.2B.
+
+The 2.2B row in the first table predates this control and can't be re-run without the TPU it was trained on, so its baseline is the shorter one. The two local points bound how much that matters. The continued-float gain shrinks with scale (1.48% at 48M, 0.76% at 76M) while the damage to post-hoc quantization stays flat (+2.24 and +2.27 points). Applying the same control at 2.2B would therefore move NativeBit's gap up by well under a point and RTN's by about two, which widens the margin rather than closing it. That is an extrapolation from two points, not a measurement.
+
+Earlier versions of this README compared against float trained only to the checkpoint QAT starts from, which put the local gaps at +2.7% and +2.5%. The numbers above use the continued-float baseline instead and supersede those.
 
 ### Downstream tasks
 
